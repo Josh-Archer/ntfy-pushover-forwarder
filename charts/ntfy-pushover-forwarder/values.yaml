@@ -1,0 +1,69 @@
+image:
+  repository: ghcr.io/josh-archer/ntfy-pushover-forwarder
+  pullPolicy: IfNotPresent
+  tag: ""
+
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+resources: {}
+
+forwarder:
+  # The base URL of the ntfy server
+  ntfyUrl: "http://ntfy.monitoring.svc.cluster.local"
+  
+  # The topics to listen to
+  topics:
+    - media-updates
+    - system-alerts
+    - cluster-events
+    - backup-status
+    - security-auth
+
+  # Custom sound mappings
+  soundMap:
+    film_projector: bike
+    tv: classical
+    musical_note: gamelan
+    books: incoming
+    mag: cosmic
+    siren: siren
+    warning: intermission
+    error: falling
+    success: magic
+    security: mechanical
+    auth: mechanical
+
+  # Custom logo URLs
+  logoMap:
+    film_projector: "https://raw.githubusercontent.com/Radarr/Radarr/develop/Logo/256.png"
+    tv: "https://raw.githubusercontent.com/Sonarr/Sonarr/develop/Logo/256.png"
+    musical_note: "https://raw.githubusercontent.com/Lidarr/Lidarr/develop/Logo/256.png"
+    books: "https://raw.githubusercontent.com/Readarr/Readarr/develop/Logo/256.png"
+    mag: "https://raw.githubusercontent.com/Prowlarr/Prowlarr/develop/Logo/256.png"
+    jellyseerr: "https://raw.githubusercontent.com/fallenbagel/jellyseerr/main/public/logo_full.png"
+
+# Existing secret containing all the tokens/keys
+existingSecret: "ntfy-secret"
+
+# If existingSecret is provided, these map the ENV VAR names to the keys inside the secret
+secretKeys:
+  ntfyToken: "token"
+  pushoverUserKey: "pushover_user_key"
+  pushoverDefaultToken: "pushover_api_token"
+  pushoverTopicTokens:
+    media-updates: "pushover_api_token_media"
+    system-alerts: "pushover_api_token_system"
+    cluster-events: "pushover_api_token_cluster"
+    backup-status: "pushover_api_token_backup"
+    security-auth: "pushover_api_token_security"

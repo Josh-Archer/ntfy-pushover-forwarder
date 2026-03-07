@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ntfy-pushover-forwarder.fullname" . }}
+  labels:
+    {{- include "ntfy-pushover-forwarder.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ntfy-pushover-forwarder.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "ntfy-pushover-forwarder.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ntfy-pushover-forwarder.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            {{- if .Values.existingSecret }}
+            - name: Forwarder__NtfyToken
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: {{ .Values.secretKeys.ntfyToken }}
+                  optional: true
+            - name: Forwarder__PushoverUserKey
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: {{ .Values.secretKeys.pushoverUserKey }}
+            - name: Forwarder__PushoverDefaultToken
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: {{ .Values.secretKeys.pushoverDefaultToken }}
+            {{- range $topic, $key := .Values.secretKeys.pushoverTopicTokens }}
+            - name: Forwarder__TopicTokens__{{ $topic }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.existingSecret }}
+                  key: {{ $key }}
+                  optional: true
+            {{- end }}
+            {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/appsettings.json
+              subPath: appsettings.json
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ntfy-pushover-forwarder.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

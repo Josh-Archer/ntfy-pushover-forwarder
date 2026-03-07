@@ -1,0 +1,16 @@
+# Build results
+bin/
+obj/
+
+# Visual Studio files
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+
+# IDEs
+.idea/
+.vscode/
+
+# Env
+.env
