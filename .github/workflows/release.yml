@@ -10,8 +10,42 @@ permissions:
   packages: write
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.tag_action.outputs.new_tag }}
+      has_new_tag: ${{ steps.tag_action.outputs.tag != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version and get tag
+        id: tag_action
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+
+      - name: Update Helm Chart Version
+        if: steps.tag_action.outputs.new_tag != ''
+        run: |
+          # Remove 'v' prefix for Helm versioning
+          NEW_VER="${{ steps.tag_action.outputs.new_version }}"
+          sed -i "s/^version: .*/version: ${NEW_VER}/" charts/ntfy-pushover-forwarder/Chart.yaml
+          
+      - name: Commit version bump back to Git
+        if: steps.tag_action.outputs.new_tag != ''
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(release): bump version to ${{ steps.tag_action.outputs.new_tag }} [skip ci]"
+          file_pattern: 'charts/ntfy-pushover-forwarder/Chart.yaml'
+
   publish-docker:
     runs-on: ubuntu-latest
+    needs: version
+    # If no new version was calculated, we can still build but it's better to only release on changes
+    if: needs.version.outputs.new_version != ''
     steps:
       - uses: actions/checkout@v4
       
@@ -37,12 +71,16 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ env.REPO_LOWER }}:latest, ghcr.io/${{ env.REPO_LOWER }}:${{ github.sha }}
+          tags: |
+            ghcr.io/${{ env.REPO_LOWER }}:latest
+            ghcr.io/${{ env.REPO_LOWER }}:${{ needs.version.outputs.new_version }}
+            ghcr.io/${{ env.REPO_LOWER }}:${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
 
   publish-helm:
     runs-on: ubuntu-latest
-    needs: publish-docker
+    needs: [version, publish-docker]
+    if: needs.version.outputs.new_version != ''
     steps:
       - uses: actions/checkout@v4
       
@@ -63,5 +101,10 @@ jobs:
       - name: Package and Push Helm Chart (OCI)
         run: |
           cd charts/ntfy-pushover-forwarder
+          # The file was updated in the version job, but since that was a separate commit push,
+          # and this checkout is fresh, we manually update it again for this build cycle
+          # using the version from the 'version' job output.
+          NEW_VER="${{ needs.version.outputs.new_version }}"
+          sed -i "s/^version: .*/version: ${NEW_VER}/" Chart.yaml
           helm package .
           helm push *.tgz oci://ghcr.io/${{ env.REPO_LOWER }}
