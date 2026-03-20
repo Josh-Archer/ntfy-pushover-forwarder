@@ -98,6 +98,12 @@ public class Worker : BackgroundService
             var msgBody = !string.IsNullOrEmpty(message.Message) ? message.Message : "No message body";
             var tags = message.Tags ?? Array.Empty<string>();
 
+            if (message.Priority < _options.MinimumPriority)
+            {
+                _logger.LogDebug("Message dropped due to low priority ({Priority} < {MinimumPriority}).", message.Priority, _options.MinimumPriority);
+                return;
+            }
+
             // Map Priority (ntfy 1-5 to pushover -2 to 2)
             int priority = 0;
             if (message.Priority >= 5) priority = 2;
@@ -242,3 +248,4 @@ public class Worker : BackgroundService
         }
     }
 }
+

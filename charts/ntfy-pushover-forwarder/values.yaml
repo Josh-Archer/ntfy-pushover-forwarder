@@ -23,6 +23,9 @@ forwarder:
   # The base URL of the ntfy server
   ntfyUrl: "http://ntfy.monitoring.svc.cluster.local"
   
+  # Minimum Priority to forward (1-5)
+  minimumPriority: 1
+
   # The topics to listen to
   topics:
     - media-updates
