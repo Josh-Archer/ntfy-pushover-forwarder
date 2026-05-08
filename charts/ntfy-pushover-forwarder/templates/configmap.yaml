@@ -10,6 +10,8 @@ data:
       "Forwarder": {
         "NtfyUrl": "{{ .Values.forwarder.ntfyUrl }}",
         "MinimumPriority": {{ .Values.forwarder.minimumPriority | default 1 }},
+        "DeduplicationWindowSeconds": {{ .Values.forwarder.deduplicationWindowSeconds | default 300 }},
+        "DeduplicationMaxEntries": {{ .Values.forwarder.deduplicationMaxEntries | default 1024 }},
         "Topics": {{ toJson .Values.forwarder.topics }},
         "SoundMap": {{ toJson .Values.forwarder.soundMap }},
         "LogoMap": {{ toJson .Values.forwarder.logoMap }}
