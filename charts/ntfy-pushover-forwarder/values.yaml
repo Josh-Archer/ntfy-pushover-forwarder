@@ -26,6 +26,11 @@ forwarder:
   # Minimum Priority to forward (1-5)
   minimumPriority: 1
 
+  # Suppress duplicate messages with the same topic/title/body/tags/priority/click.
+  # This protects high-volume topics from upstream retry storms.
+  deduplicationWindowSeconds: 300
+  deduplicationMaxEntries: 1024
+
   # The topics to listen to
   topics:
     - media-updates

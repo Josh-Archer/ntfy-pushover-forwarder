@@ -1,4 +1,6 @@
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using NtfyPushoverForwarder.Models;
@@ -11,6 +13,8 @@ public class Worker : BackgroundService
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ForwarderOptions _options;
     private readonly Dictionary<string, byte[]> _iconCache = new();
+    private readonly Dictionary<string, DateTimeOffset> _recentMessages = new();
+    private readonly object _dedupeLock = new();
 
     public Worker(ILogger<Worker> logger, IHttpClientFactory httpClientFactory, IOptions<ForwarderOptions> options)
     {
@@ -101,6 +105,12 @@ public class Worker : BackgroundService
             if (message.Priority < _options.MinimumPriority)
             {
                 _logger.LogDebug("Message dropped due to low priority ({Priority} < {MinimumPriority}).", message.Priority, _options.MinimumPriority);
+                return;
+            }
+
+            if (IsDuplicateMessage(topic, title, msgBody, tags, message))
+            {
+                _logger.LogInformation("Duplicate ntfy message suppressed for topic {Topic}: {Title}", topic, title);
                 return;
             }
 
@@ -246,6 +256,52 @@ public class Worker : BackgroundService
         {
             _logger.LogError(ex, "Error forwarding message to Pushover for topic {Topic}", topic);
         }
+    }
+
+    private bool IsDuplicateMessage(string topic, string title, string messageBody, string[] tags, NtfyMessage message)
+    {
+        if (_options.DeduplicationWindowSeconds <= 0)
+        {
+            return false;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var cutoff = now.AddSeconds(-_options.DeduplicationWindowSeconds);
+        var fingerprint = BuildMessageFingerprint(topic, title, messageBody, tags, message);
+
+        lock (_dedupeLock)
+        {
+            foreach (var staleKey in _recentMessages.Where(entry => entry.Value < cutoff).Select(entry => entry.Key).ToArray())
+            {
+                _recentMessages.Remove(staleKey);
+            }
+
+            if (_recentMessages.ContainsKey(fingerprint))
+            {
+                return true;
+            }
+
+            _recentMessages[fingerprint] = now;
+
+            var maxEntries = Math.Max(1, _options.DeduplicationMaxEntries);
+            if (_recentMessages.Count > maxEntries)
+            {
+                foreach (var oldestKey in _recentMessages.OrderBy(entry => entry.Value).Take(_recentMessages.Count - maxEntries).Select(entry => entry.Key).ToArray())
+                {
+                    _recentMessages.Remove(oldestKey);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static string BuildMessageFingerprint(string topic, string title, string messageBody, string[] tags, NtfyMessage message)
+    {
+        var canonicalTags = string.Join(",", tags.OrderBy(tag => tag, StringComparer.Ordinal));
+        var payload = string.Join("\u001f", topic, title, messageBody, canonicalTags, message.Priority?.ToString() ?? string.Empty, message.Click ?? string.Empty);
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(payload));
+        return Convert.ToHexString(bytes);
     }
 }
 
