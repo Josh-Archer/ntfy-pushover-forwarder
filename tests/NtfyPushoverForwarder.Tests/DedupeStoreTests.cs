@@ -9,7 +9,9 @@ public class DedupeStoreTests
     {
         var store = new InMemoryDedupeStore();
         var now = DateTimeOffset.UtcNow;
+        Assert.False(store.Contains("a", now, TimeSpan.FromMinutes(5)));
         Assert.False(store.TryRecord("a", now, TimeSpan.FromMinutes(5), 100));
+        Assert.True(store.Contains("a", now.AddSeconds(1), TimeSpan.FromMinutes(5)));
         Assert.True(store.TryRecord("a", now.AddSeconds(1), TimeSpan.FromMinutes(5), 100));
         Assert.False(store.TryRecord("b", now.AddSeconds(1), TimeSpan.FromMinutes(5), 100));
     }

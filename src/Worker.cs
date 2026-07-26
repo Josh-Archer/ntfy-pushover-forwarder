@@ -116,8 +116,15 @@ public class Worker : BackgroundService
                     }
                 }
 
+                // Clean EOF: apply same backoff/recovery path as hard failures to avoid reconnect storms.
                 _connections.MarkDisconnected(topic);
-                _logger.LogWarning("SSE stream ended for topic {Topic}", topic);
+                _connections.MarkOutageAlerted(topic);
+                _metrics.Reconnect(topic);
+                var eofDelay = reconnect.NextDelay();
+                _logger.LogWarning(
+                    "SSE stream ended for topic {Topic}. Retrying in {DelaySeconds:F1}s (attempt {Attempt})...",
+                    topic, eofDelay.TotalSeconds, reconnect.Attempt);
+                await Task.Delay(eofDelay, stoppingToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -192,7 +199,7 @@ public class Worker : BackgroundService
 
             var fingerprint = MessageFingerprint.Build(topic, title, msgBody, tags, message);
             var window = TimeSpan.FromSeconds(_options.DeduplicationWindowSeconds);
-            if (_dedupeStore.TryRecord(fingerprint, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries))
+            if (_dedupeStore.Contains(fingerprint, DateTimeOffset.UtcNow, window))
             {
                 _metrics.DroppedDedupe(topic);
                 _logger.LogInformation("Duplicate ntfy message suppressed for topic {Topic}: {Title}", topic, title);
@@ -272,6 +279,8 @@ public class Worker : BackgroundService
             }
             else
             {
+                // Only suppress duplicates after a successful forward.
+                _dedupeStore.TryRecord(fingerprint, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries);
                 _metrics.Forwarded(topic);
             }
         }

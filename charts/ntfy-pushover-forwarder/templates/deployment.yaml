@@ -6,6 +6,8 @@ metadata:
     {{- include "ntfy-pushover-forwarder.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: {{ .Values.strategy.type | default "Recreate" }}
   selector:
     matchLabels:
       {{- include "ntfy-pushover-forwarder.selectorLabels" . | nindent 6 }}
