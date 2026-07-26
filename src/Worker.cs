@@ -1,5 +1,4 @@
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
@@ -12,15 +11,25 @@ public class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ForwarderOptions _options;
+    private readonly ForwarderMetrics _metrics;
+    private readonly TopicConnectionTracker _connections;
+    private readonly IDedupeStore _dedupeStore;
     private readonly Dictionary<string, byte[]> _iconCache = new();
-    private readonly Dictionary<string, DateTimeOffset> _recentMessages = new();
-    private readonly object _dedupeLock = new();
 
-    public Worker(ILogger<Worker> logger, IHttpClientFactory httpClientFactory, IOptions<ForwarderOptions> options)
+    public Worker(
+        ILogger<Worker> logger,
+        IHttpClientFactory httpClientFactory,
+        IOptions<ForwarderOptions> options,
+        ForwarderMetrics metrics,
+        TopicConnectionTracker connections,
+        IDedupeStore dedupeStore)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _options = options.Value;
+        _metrics = metrics;
+        _connections = connections;
+        _dedupeStore = dedupeStore;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -45,24 +54,36 @@ public class Worker : BackgroundService
 
     private async Task ListenToTopicAsync(string topic, CancellationToken stoppingToken)
     {
+        var reconnect = new SseReconnectPolicy();
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                _logger.LogInformation("Connecting to ntfy topic: {Topic}", topic);
+                var since = _connections.GetSinceCursor(topic);
+                var url = SseReconnectPolicy.BuildSubscribeUrl(_options.NtfyUrl, topic, since);
+                _logger.LogInformation("Connecting to ntfy topic: {Topic} (since={Since})", topic, since ?? "live");
+
                 var client = _httpClientFactory.CreateClient("NtfyClient");
                 client.Timeout = Timeout.InfiniteTimeSpan;
 
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
                 if (!string.IsNullOrEmpty(_options.NtfyToken))
                 {
-                    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.NtfyToken);
+                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.NtfyToken);
                 }
 
-                var url = $"{_options.NtfyUrl.TrimEnd('/')}/{topic}/json";
-                using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                
                 using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, stoppingToken);
                 response.EnsureSuccessStatusCode();
+
+                _connections.MarkConnected(topic);
+                if (_options.SendRecoveryAlerts && _connections.ShouldSendRecovery(topic))
+                {
+                    await SendRecoveryAlertAsync(topic, stoppingToken);
+                    _connections.MarkRecoverySent(topic);
+                }
+
+                reconnect.Reset();
 
                 using var stream = await response.Content.ReadAsStreamAsync(stoppingToken);
                 using var reader = new StreamReader(stream);
@@ -70,13 +91,22 @@ public class Worker : BackgroundService
                 while (!reader.EndOfStream && !stoppingToken.IsCancellationRequested)
                 {
                     var line = await reader.ReadLineAsync(stoppingToken);
-                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
 
                     try
                     {
                         var message = JsonSerializer.Deserialize<NtfyMessage>(line);
-                        if (message != null && message.Event == "message")
+                        if (message == null)
                         {
+                            continue;
+                        }
+
+                        if (message.Event == "message")
+                        {
+                            _connections.NoteMessage(topic, message.Id, message.Time);
                             await ForwardToPushoverAsync(topic, message, stoppingToken);
                         }
                     }
@@ -85,12 +115,58 @@ public class Worker : BackgroundService
                         _logger.LogError(ex, "Failed to parse message from ntfy: {Line}", line);
                     }
                 }
+
+                _connections.MarkDisconnected(topic);
+                _logger.LogWarning("SSE stream ended for topic {Topic}", topic);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogError(ex, "Error listening to topic {Topic}. Retrying in 5 seconds...", topic);
-                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                _connections.MarkDisconnected(topic);
+                _connections.MarkOutageAlerted(topic);
+                _metrics.Reconnect(topic);
+                var delay = reconnect.NextDelay();
+                _logger.LogError(ex, "Error listening to topic {Topic}. Retrying in {DelaySeconds:F1}s (attempt {Attempt})...",
+                    topic, delay.TotalSeconds, reconnect.Attempt);
+                await Task.Delay(delay, stoppingToken);
             }
+        }
+    }
+
+    private async Task SendRecoveryAlertAsync(string topic, CancellationToken stoppingToken)
+    {
+        try
+        {
+            if (!_options.TopicTokens.TryGetValue(topic, out var token) || string.IsNullOrEmpty(token))
+            {
+                token = _options.PushoverDefaultToken;
+            }
+
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(_options.PushoverUserKey))
+            {
+                return;
+            }
+
+            using var content = new MultipartFormDataContent
+            {
+                { new StringContent(token), "token" },
+                { new StringContent(_options.PushoverUserKey), "user" },
+                { new StringContent($"ntfy recovered: {topic}"), "title" },
+                { new StringContent($"SSE connection to topic '{topic}' restored after outage."), "message" },
+                { new StringContent("0"), "priority" },
+                { new StringContent("magic"), "sound" }
+            };
+
+            var client = _httpClientFactory.CreateClient("PushoverClient");
+            var response = await client.PostAsync(_options.PushoverUrl, content, stoppingToken);
+            if (response.IsSuccessStatusCode)
+            {
+                _metrics.RecoveryAlert(topic);
+                _logger.LogInformation("Sent recovery alert for topic {Topic}", topic);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to send recovery alert for topic {Topic}", topic);
         }
     }
 
@@ -98,29 +174,33 @@ public class Worker : BackgroundService
     {
         try
         {
+            _metrics.Received(topic);
+
             var title = !string.IsNullOrEmpty(message.Title) ? message.Title : $"ntfy: {topic}";
             var msgBody = !string.IsNullOrEmpty(message.Message) ? message.Message : "No message body";
             var tags = message.Tags ?? Array.Empty<string>();
 
-            if (message.Priority < _options.MinimumPriority)
+            if (!PriorityMapper.MeetsMinimum(message.Priority, _options.MinimumPriority))
             {
-                _logger.LogDebug("Message dropped due to low priority ({Priority} < {MinimumPriority}).", message.Priority, _options.MinimumPriority);
+                _metrics.DroppedPriority(topic);
+                _logger.LogDebug(
+                    "Message dropped due to low priority ({Priority} < {MinimumPriority}).",
+                    PriorityMapper.ResolveNtfyPriority(message.Priority),
+                    _options.MinimumPriority);
                 return;
             }
 
-            if (IsDuplicateMessage(topic, title, msgBody, tags, message))
+            var fingerprint = MessageFingerprint.Build(topic, title, msgBody, tags, message);
+            var window = TimeSpan.FromSeconds(_options.DeduplicationWindowSeconds);
+            if (_dedupeStore.TryRecord(fingerprint, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries))
             {
+                _metrics.DroppedDedupe(topic);
                 _logger.LogInformation("Duplicate ntfy message suppressed for topic {Topic}: {Title}", topic, title);
                 return;
             }
 
-            // Map Priority (ntfy 1-5 to pushover -2 to 2)
-            int priority = 0;
-            if (message.Priority >= 5) priority = 2;
-            else if (message.Priority == 4) priority = 1;
-            else if (message.Priority <= 2) priority = -1;
+            var priority = PriorityMapper.ToPushover(message.Priority);
 
-            // Select Token
             if (!_options.TopicTokens.TryGetValue(topic, out var token) || string.IsNullOrEmpty(token))
             {
                 token = _options.PushoverDefaultToken;
@@ -129,10 +209,10 @@ public class Worker : BackgroundService
             if (string.IsNullOrEmpty(token))
             {
                 _logger.LogError("No Pushover token available for topic {Topic}", topic);
+                _metrics.ForwardFailed(topic);
                 return;
             }
 
-            // Sound Mapping
             string sound = "pushover";
             foreach (var tag in tags)
             {
@@ -143,8 +223,10 @@ public class Worker : BackgroundService
                 }
             }
 
-            // Device Targeting
-            string? device = tags.FirstOrDefault(t => t.StartsWith("device:"))?.Substring(7);
+            string? device = tags.FirstOrDefault(t => t.StartsWith("device:", StringComparison.Ordinal))?.Substring(7);
+
+            var formattedBody = MessageFormatting.ApplyFormatting(msgBody, message);
+            var useHtml = MessageFormatting.ShouldUseHtml(message, formattedBody);
 
             _logger.LogInformation("Forwarding {Topic} [{Sound}]: {Title}", topic, sound, title);
 
@@ -152,15 +234,24 @@ public class Worker : BackgroundService
             content.Add(new StringContent(token), "token");
             content.Add(new StringContent(_options.PushoverUserKey), "user");
             content.Add(new StringContent(title), "title");
-            content.Add(new StringContent(msgBody), "message");
+            content.Add(new StringContent(formattedBody), "message");
             content.Add(new StringContent(priority.ToString()), "priority");
             content.Add(new StringContent(sound), "sound");
 
+            if (useHtml)
+            {
+                content.Add(new StringContent("1"), "html");
+            }
+
             if (!string.IsNullOrEmpty(device))
+            {
                 content.Add(new StringContent(device), "device");
+            }
 
             if (!string.IsNullOrEmpty(message.Click))
+            {
                 content.Add(new StringContent(message.Click), "url");
+            }
 
             if (priority == 2)
             {
@@ -168,140 +259,109 @@ public class Worker : BackgroundService
                 content.Add(new StringContent("3600"), "expire");
             }
 
-            // Attachment / Logo Logic
-            string? attUrl = null;
-            bool isLogo = false;
-
-            if (message.Attachment != null && !string.IsNullOrEmpty(message.Attachment.Url))
-            {
-                attUrl = message.Attachment.Url;
-                if (attUrl.StartsWith("/"))
-                {
-                    attUrl = $"{_options.NtfyUrl.TrimEnd('/')}{attUrl}";
-                }
-            }
-            else
-            {
-                // Fallback to logo mapping
-                foreach (var tag in tags)
-                {
-                    if (_options.LogoMap.TryGetValue(tag, out var mappedLogo))
-                    {
-                        attUrl = mappedLogo;
-                        isLogo = true;
-                        break;
-                    }
-                }
-                
-                if (string.IsNullOrEmpty(attUrl) && topic.Contains("media"))
-                {
-                    _options.LogoMap.TryGetValue("mag", out attUrl);
-                    isLogo = true;
-                }
-            }
-
-            if (!string.IsNullOrEmpty(attUrl))
-            {
-                byte[]? fileBytes = null;
-                string fileName = "image.png";
-                string mediaType = "image/png";
-
-                if (isLogo && _iconCache.TryGetValue(attUrl, out var cachedBytes))
-                {
-                    fileBytes = cachedBytes;
-                }
-                else
-                {
-                    try
-                    {
-                        var client = _httpClientFactory.CreateClient("AttachmentClient");
-                        client.Timeout = TimeSpan.FromSeconds(10);
-                        var attResponse = await client.GetAsync(attUrl, stoppingToken);
-                        if (attResponse.IsSuccessStatusCode)
-                        {
-                            fileBytes = await attResponse.Content.ReadAsByteArrayAsync(stoppingToken);
-                            mediaType = attResponse.Content.Headers.ContentType?.MediaType ?? (isLogo ? "image/png" : "image/jpeg");
-                            fileName = isLogo ? "logo.png" : "attachment" + (mediaType.Contains("png") ? ".png" : ".jpg");
-
-                            if (isLogo)
-                            {
-                                _iconCache[attUrl] = fileBytes;
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to download attachment/logo from {Url}", attUrl);
-                    }
-                }
-
-                if (fileBytes != null)
-                {
-                    var fileContent = new ByteArrayContent(fileBytes);
-                    fileContent.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
-                    content.Add(fileContent, "attachment", fileName);
-                }
-            }
+            await AttachImageAsync(content, topic, message, tags, stoppingToken);
 
             var pushoverClient = _httpClientFactory.CreateClient("PushoverClient");
             var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
-            
+
             if (!response.IsSuccessStatusCode)
             {
                 var responseBody = await response.Content.ReadAsStringAsync(stoppingToken);
                 _logger.LogError("Pushover API Error {StatusCode}: {ResponseBody}", response.StatusCode, responseBody);
+                _metrics.ForwardFailed(topic);
+            }
+            else
+            {
+                _metrics.Forwarded(topic);
             }
         }
         catch (Exception ex)
         {
+            _metrics.ForwardFailed(topic);
             _logger.LogError(ex, "Error forwarding message to Pushover for topic {Topic}", topic);
         }
     }
 
-    private bool IsDuplicateMessage(string topic, string title, string messageBody, string[] tags, NtfyMessage message)
+    private async Task AttachImageAsync(
+        MultipartFormDataContent content,
+        string topic,
+        NtfyMessage message,
+        string[] tags,
+        CancellationToken stoppingToken)
     {
-        if (_options.DeduplicationWindowSeconds <= 0)
+        string? attUrl = null;
+        bool isLogo = false;
+
+        if (message.Attachment != null && !string.IsNullOrEmpty(message.Attachment.Url))
         {
-            return false;
+            attUrl = message.Attachment.Url;
+            if (attUrl.StartsWith('/'))
+            {
+                attUrl = $"{_options.NtfyUrl.TrimEnd('/')}{attUrl}";
+            }
         }
-
-        var now = DateTimeOffset.UtcNow;
-        var cutoff = now.AddSeconds(-_options.DeduplicationWindowSeconds);
-        var fingerprint = BuildMessageFingerprint(topic, title, messageBody, tags, message);
-
-        lock (_dedupeLock)
+        else
         {
-            foreach (var staleKey in _recentMessages.Where(entry => entry.Value < cutoff).Select(entry => entry.Key).ToArray())
+            foreach (var tag in tags)
             {
-                _recentMessages.Remove(staleKey);
-            }
-
-            if (_recentMessages.ContainsKey(fingerprint))
-            {
-                return true;
-            }
-
-            _recentMessages[fingerprint] = now;
-
-            var maxEntries = Math.Max(1, _options.DeduplicationMaxEntries);
-            if (_recentMessages.Count > maxEntries)
-            {
-                foreach (var oldestKey in _recentMessages.OrderBy(entry => entry.Value).Take(_recentMessages.Count - maxEntries).Select(entry => entry.Key).ToArray())
+                if (_options.LogoMap.TryGetValue(tag, out var mappedLogo))
                 {
-                    _recentMessages.Remove(oldestKey);
+                    attUrl = mappedLogo;
+                    isLogo = true;
+                    break;
                 }
             }
+
+            if (string.IsNullOrEmpty(attUrl) && topic.Contains("media", StringComparison.OrdinalIgnoreCase))
+            {
+                _options.LogoMap.TryGetValue("mag", out attUrl);
+                isLogo = true;
+            }
         }
 
-        return false;
-    }
+        if (string.IsNullOrEmpty(attUrl))
+        {
+            return;
+        }
 
-    private static string BuildMessageFingerprint(string topic, string title, string messageBody, string[] tags, NtfyMessage message)
-    {
-        var canonicalTags = string.Join(",", tags.OrderBy(tag => tag, StringComparer.Ordinal));
-        var payload = string.Join("\u001f", topic, title, messageBody, canonicalTags, message.Priority?.ToString() ?? string.Empty, message.Click ?? string.Empty);
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(payload));
-        return Convert.ToHexString(bytes);
+        byte[]? fileBytes = null;
+        string fileName = "image.png";
+        string mediaType = "image/png";
+
+        if (isLogo && _iconCache.TryGetValue(attUrl, out var cachedBytes))
+        {
+            fileBytes = cachedBytes;
+        }
+        else
+        {
+            try
+            {
+                var client = _httpClientFactory.CreateClient("AttachmentClient");
+                client.Timeout = TimeSpan.FromSeconds(10);
+                var attResponse = await client.GetAsync(attUrl, stoppingToken);
+                if (attResponse.IsSuccessStatusCode)
+                {
+                    fileBytes = await attResponse.Content.ReadAsByteArrayAsync(stoppingToken);
+                    mediaType = attResponse.Content.Headers.ContentType?.MediaType ?? (isLogo ? "image/png" : "image/jpeg");
+                    fileName = isLogo ? "logo.png" : "attachment" + (mediaType.Contains("png", StringComparison.Ordinal) ? ".png" : ".jpg");
+
+                    if (isLogo)
+                    {
+                        _iconCache[attUrl] = fileBytes;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to download attachment/logo from {Url}", attUrl);
+            }
+        }
+
+        if (fileBytes != null)
+        {
+            var fileContent = new ByteArrayContent(fileBytes);
+            fileContent.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
+            content.Add(fileContent, "attachment", fileName);
+        }
     }
 }
-

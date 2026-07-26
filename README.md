@@ -13,7 +13,28 @@ This project was created to solve the limitations of the free ntfy mobile app (s
   - Automatically forwards images attached to `ntfy` messages.
   - Features an **Icon Fallback** system: Map tags (e.g., `film_projector` for Radarr) to specific URLs. If a message lacks an image attachment, the forwarder will download the mapped application logo and attach it to the Pushover notification so it appears beautifully on your lock screen.
 - **Device Targeting:** Target specific devices in your Pushover account using `ntfy` tags like `device:iphone`.
-- **Priority Mapping:** Automatically translates `ntfy` priorities (1-5) to the corresponding Pushover priorities (-2 to 2), including handling emergency alerts with retry/expire logic.
+- **Priority Mapping:** Full ntfy 1–5 → Pushover −2..2 map. Null/missing ntfy priority is treated as **3** (ntfy default) and respects `MinimumPriority`.
+- **Smart Dedup:** Prefer ntfy message `id`; fall back to content hash. Optional **persistent dedupe store** across restarts (`DeduplicationStorePath` / chart PVC).
+- **Resilient SSE:** Exponential backoff with jitter and `since=` resume after disconnects.
+- **Recovery Alerts:** Optional Pushover notice when a topic SSE connection recovers after an outage.
+- **Formatting:** `html` / `markdown` tags map to Pushover HTML (backticks → `<code>`).
+- **Observability:** `/healthz` and Prometheus `/metrics` (OpenTelemetry meters).
+
+### Priority map
+
+| ntfy | Pushover |
+|------|----------|
+| 1    | -2       |
+| 2    | -1       |
+| 3 (default if omitted) | 0 |
+| 4    | 1        |
+| 5+   | 2        |
+
+## 🧪 Tests
+
+```bash
+dotnet test NtfyPushoverForwarder.sln -c Release
+```
 
 ## 🚀 Deployment
 

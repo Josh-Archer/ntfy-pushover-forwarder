@@ -13,6 +13,11 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.metrics.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.service.port | quote }}
+        prometheus.io/path: "/metrics"
+        {{- end }}
       {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -32,7 +37,33 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          {{- end }}
           env:
+            - name: Forwarder__HttpPort
+              value: {{ .Values.service.port | quote }}
+            {{- if .Values.persistence.enabled }}
+            - name: Forwarder__DeduplicationStorePath
+              value: {{ .Values.persistence.mountPath | default "/data" }}/dedupe.json
+            {{- end }}
             {{- if .Values.existingSecret }}
             - name: Forwarder__NtfyToken
               valueFrom:
@@ -64,12 +95,21 @@ spec:
               mountPath: /app/appsettings.json
               subPath: appsettings.json
               readOnly: true
+            {{- if .Values.persistence.enabled }}
+            - name: dedupe-data
+              mountPath: {{ .Values.persistence.mountPath | default "/data" }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: config
           configMap:
             name: {{ include "ntfy-pushover-forwarder.fullname" . }}
+        {{- if .Values.persistence.enabled }}
+        - name: dedupe-data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (printf "%s-dedupe" (include "ntfy-pushover-forwarder.fullname" .)) }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -3,22 +3,25 @@ name: CI
 on:
   pull_request:
     branches: [ main ]
+  push:
+    branches: [ main ]
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 9.0.x
-          
-      - name: Restore dependencies
-        run: dotnet restore
-        working-directory: ./src
-        
+
+      - name: Restore
+        run: dotnet restore NtfyPushoverForwarder.sln
+
       - name: Build
-        run: dotnet build --no-restore -c Release
-        working-directory: ./src
+        run: dotnet build NtfyPushoverForwarder.sln --no-restore -c Release
+
+      - name: Test
+        run: dotnet test NtfyPushoverForwarder.sln --no-build -c Release --verbosity normal
