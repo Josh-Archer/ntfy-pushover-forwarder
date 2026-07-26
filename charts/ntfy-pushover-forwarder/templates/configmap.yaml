@@ -12,6 +12,8 @@ data:
         "MinimumPriority": {{ .Values.forwarder.minimumPriority | default 1 }},
         "DeduplicationWindowSeconds": {{ .Values.forwarder.deduplicationWindowSeconds | default 300 }},
         "DeduplicationMaxEntries": {{ .Values.forwarder.deduplicationMaxEntries | default 1024 }},
+        "SendRecoveryAlerts": {{ .Values.forwarder.sendRecoveryAlerts | default true | toJson }},
+        "HttpPort": {{ .Values.service.port | default 8080 }},
         "Topics": {{ toJson .Values.forwarder.topics }},
         "SoundMap": {{ toJson .Values.forwarder.soundMap }},
         "LogoMap": {{ toJson .Values.forwarder.logoMap }}

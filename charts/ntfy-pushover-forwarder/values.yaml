@@ -19,17 +19,46 @@ podSecurityContext: {}
 securityContext: {}
 resources: {}
 
+service:
+  enabled: true
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+metrics:
+  enabled: true
+
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 10
+  periodSeconds: 30
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+persistence:
+  enabled: true
+  accessMode: ReadWriteOnce
+  size: 100Mi
+  mountPath: /data
+  # storageClassName: ""
+  # existingClaim: ""
+
 forwarder:
   # The base URL of the ntfy server
   ntfyUrl: "http://ntfy.monitoring.svc.cluster.local"
   
-  # Minimum Priority to forward (1-5)
+  # Minimum Priority to forward (1-5). Null ntfy priority is treated as 3.
   minimumPriority: 1
 
-  # Suppress duplicate messages with the same topic/title/body/tags/priority/click.
-  # This protects high-volume topics from upstream retry storms.
+  # Suppress duplicate messages. Prefer ntfy message id; fall back to content hash.
   deduplicationWindowSeconds: 300
   deduplicationMaxEntries: 1024
+
+  # Send Pushover recovery notification after SSE reconnect following an outage
+  sendRecoveryAlerts: true
 
   # The topics to listen to
   topics:
