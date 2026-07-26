@@ -15,9 +15,23 @@ serviceAccount:
   name: ""
 
 podAnnotations: {}
-podSecurityContext: {}
-securityContext: {}
+# Match non-root $APP_UID from the aspnet image so the dedupe PVC is writable.
+podSecurityContext:
+  fsGroup: 1654
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1654
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
 resources: {}
+
+# RWO dedupe PVC: avoid surge pods that cannot attach the volume.
+strategy:
+  type: Recreate
 
 service:
   enabled: true

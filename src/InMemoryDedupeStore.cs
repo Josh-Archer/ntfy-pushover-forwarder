@@ -10,6 +10,20 @@ public sealed class InMemoryDedupeStore : IDedupeStore
         get { lock (_lock) return _entries.Count; }
     }
 
+    public bool Contains(string fingerprint, DateTimeOffset now, TimeSpan window)
+    {
+        if (window <= TimeSpan.Zero)
+        {
+            return false;
+        }
+
+        var cutoff = now - window;
+        lock (_lock)
+        {
+            return _entries.TryGetValue(fingerprint, out var seen) && seen >= cutoff;
+        }
+    }
+
     public bool TryRecord(string fingerprint, DateTimeOffset now, TimeSpan window, int maxEntries)
     {
         if (window <= TimeSpan.Zero)

@@ -21,6 +21,9 @@ public sealed class FileDedupeStore : IDedupeStore
         Load(window, maxEntries);
     }
 
+    public bool Contains(string fingerprint, DateTimeOffset now, TimeSpan window)
+        => _memory.Contains(fingerprint, now, window);
+
     public bool TryRecord(string fingerprint, DateTimeOffset now, TimeSpan window, int maxEntries)
     {
         var isDuplicate = _memory.TryRecord(fingerprint, now, window, maxEntries);
