@@ -106,8 +106,7 @@ public class Worker : BackgroundService
 
                         if (message.Event == "message")
                         {
-                            _connections.NoteMessage(topic, message.Id, message.Time);
-                            await ForwardToPushoverAsync(topic, message, stoppingToken);
+                            await HandleMessageAsync(topic, message, stoppingToken);
                         }
                     }
                     catch (JsonException ex)
@@ -177,7 +176,25 @@ public class Worker : BackgroundService
         }
     }
 
-    private async Task ForwardToPushoverAsync(string topic, NtfyMessage message, CancellationToken stoppingToken)
+    /// <summary>
+    /// Forward a message, then advance the SSE cursor only when the message was handled
+    /// (successful forward or intentional drop). Failed Pushover posts leave the cursor
+    /// unchanged so reconnect can retry.
+    /// </summary>
+    internal async Task HandleMessageAsync(string topic, NtfyMessage message, CancellationToken stoppingToken)
+    {
+        var handled = await ForwardToPushoverAsync(topic, message, stoppingToken);
+        if (handled)
+        {
+            _connections.NoteMessage(topic, message.Id, message.Time);
+        }
+    }
+
+    /// <returns>
+    /// True when the cursor should advance (forwarded or intentionally dropped);
+    /// false when forwarding failed and the message should be retried after reconnect.
+    /// </returns>
+    internal async Task<bool> ForwardToPushoverAsync(string topic, NtfyMessage message, CancellationToken stoppingToken)
     {
         try
         {
@@ -194,7 +211,7 @@ public class Worker : BackgroundService
                     "Message dropped due to low priority ({Priority} < {MinimumPriority}).",
                     PriorityMapper.ResolveNtfyPriority(message.Priority),
                     _options.MinimumPriority);
-                return;
+                return true;
             }
 
             var fingerprint = MessageFingerprint.Build(topic, title, msgBody, tags, message);
@@ -203,7 +220,7 @@ public class Worker : BackgroundService
             {
                 _metrics.DroppedDedupe(topic);
                 _logger.LogInformation("Duplicate ntfy message suppressed for topic {Topic}: {Title}", topic, title);
-                return;
+                return true;
             }
 
             var priority = PriorityMapper.ToPushover(message.Priority);
@@ -217,7 +234,7 @@ public class Worker : BackgroundService
             {
                 _logger.LogError("No Pushover token available for topic {Topic}", topic);
                 _metrics.ForwardFailed(topic);
-                return;
+                return false;
             }
 
             string sound = "pushover";
@@ -276,18 +293,19 @@ public class Worker : BackgroundService
                 var responseBody = await response.Content.ReadAsStringAsync(stoppingToken);
                 _logger.LogError("Pushover API Error {StatusCode}: {ResponseBody}", response.StatusCode, responseBody);
                 _metrics.ForwardFailed(topic);
+                return false;
             }
-            else
-            {
-                // Only suppress duplicates after a successful forward.
-                _dedupeStore.TryRecord(fingerprint, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries);
-                _metrics.Forwarded(topic);
-            }
+
+            // Only suppress duplicates after a successful forward.
+            _dedupeStore.TryRecord(fingerprint, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries);
+            _metrics.Forwarded(topic);
+            return true;
         }
         catch (Exception ex)
         {
             _metrics.ForwardFailed(topic);
             _logger.LogError(ex, "Error forwarding message to Pushover for topic {Topic}", topic);
+            return false;
         }
     }
 
