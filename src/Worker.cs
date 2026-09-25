@@ -291,7 +291,7 @@ public class Worker : BackgroundService
         }
     }
 
-    private async Task AttachImageAsync(
+    internal async Task AttachImageAsync(
         MultipartFormDataContent content,
         string topic,
         NtfyMessage message,
@@ -307,6 +307,10 @@ public class Worker : BackgroundService
             if (attUrl.StartsWith('/'))
             {
                 attUrl = $"{_options.NtfyUrl.TrimEnd('/')}{attUrl}";
+            }
+            else if (!Uri.TryCreate(attUrl, UriKind.Absolute, out _))
+            {
+                attUrl = $"{_options.NtfyUrl.TrimEnd('/')}/{attUrl}";
             }
         }
         else
@@ -347,7 +351,13 @@ public class Worker : BackgroundService
             {
                 var client = _httpClientFactory.CreateClient("AttachmentClient");
                 client.Timeout = TimeSpan.FromSeconds(10);
-                var attResponse = await client.GetAsync(attUrl, stoppingToken);
+                using var request = new HttpRequestMessage(HttpMethod.Get, attUrl);
+                if (!isLogo && !string.IsNullOrEmpty(_options.NtfyToken) && IsSameOrigin(attUrl, _options.NtfyUrl))
+                {
+                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.NtfyToken);
+                }
+
+                using var attResponse = await client.SendAsync(request, stoppingToken);
                 if (attResponse.IsSuccessStatusCode)
                 {
                     fileBytes = await attResponse.Content.ReadAsByteArrayAsync(stoppingToken);
@@ -358,6 +368,10 @@ public class Worker : BackgroundService
                     {
                         _iconCache[attUrl] = fileBytes;
                     }
+                }
+                else
+                {
+                    _logger.LogWarning("Failed to download attachment/logo from {Url}: HTTP {StatusCode}", attUrl, attResponse.StatusCode);
                 }
             }
             catch (Exception ex)
@@ -372,5 +386,23 @@ public class Worker : BackgroundService
             fileContent.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
             content.Add(fileContent, "attachment", fileName);
         }
+    }
+
+    internal static bool IsSameOrigin(string? targetUrl, string? baseUrl)
+    {
+        if (string.IsNullOrWhiteSpace(targetUrl) || string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return false;
+        }
+
+        if (!Uri.TryCreate(targetUrl, UriKind.Absolute, out var targetUri) ||
+            !Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri))
+        {
+            return false;
+        }
+
+        return string.Equals(targetUri.Scheme, baseUri.Scheme, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(targetUri.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase) &&
+               targetUri.Port == baseUri.Port;
     }
 }

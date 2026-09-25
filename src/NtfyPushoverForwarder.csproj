@@ -13,4 +13,8 @@
     <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.11.2" />
     <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" Version="1.11.1" />
   </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="NtfyPushoverForwarder.Tests" />
+  </ItemGroup>
 </Project>
