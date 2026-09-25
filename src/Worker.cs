@@ -308,6 +308,10 @@ public class Worker : BackgroundService
             {
                 attUrl = $"{_options.NtfyUrl.TrimEnd('/')}{attUrl}";
             }
+            else if (!Uri.TryCreate(attUrl, UriKind.Absolute, out _))
+            {
+                attUrl = $"{_options.NtfyUrl.TrimEnd('/')}/{attUrl}";
+            }
         }
         else
         {
@@ -348,7 +352,7 @@ public class Worker : BackgroundService
                 var client = _httpClientFactory.CreateClient("AttachmentClient");
                 client.Timeout = TimeSpan.FromSeconds(10);
                 using var request = new HttpRequestMessage(HttpMethod.Get, attUrl);
-                if (!isLogo && !string.IsNullOrEmpty(_options.NtfyToken))
+                if (!isLogo && !string.IsNullOrEmpty(_options.NtfyToken) && IsSameOrigin(attUrl, _options.NtfyUrl))
                 {
                     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.NtfyToken);
                 }
@@ -382,5 +386,23 @@ public class Worker : BackgroundService
             fileContent.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
             content.Add(fileContent, "attachment", fileName);
         }
+    }
+
+    internal static bool IsSameOrigin(string? targetUrl, string? baseUrl)
+    {
+        if (string.IsNullOrWhiteSpace(targetUrl) || string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return false;
+        }
+
+        if (!Uri.TryCreate(targetUrl, UriKind.Absolute, out var targetUri) ||
+            !Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri))
+        {
+            return false;
+        }
+
+        return string.Equals(targetUri.Scheme, baseUri.Scheme, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(targetUri.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase) &&
+               targetUri.Port == baseUri.Port;
     }
 }
