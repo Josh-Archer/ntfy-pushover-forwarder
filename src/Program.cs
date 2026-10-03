@@ -27,7 +27,8 @@ builder.Services.AddSingleton<IDedupeStore>(sp =>
 });
 builder.Services.AddHostedService<Worker>();
 builder.Services.AddHealthChecks()
-    .AddCheck("self", () => HealthCheckResult.Healthy("forwarder process up"));
+    .AddCheck("self", () => HealthCheckResult.Healthy("forwarder process up"))
+    .AddCheck<TopicHealthCheck>("topics");
 
 builder.Services.AddOpenTelemetry()
     .WithMetrics(metrics =>
