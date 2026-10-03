@@ -53,6 +53,32 @@ public sealed class TopicConnectionTracker
         }
     }
 
+    public bool IsConnected(string topic)
+    {
+        lock (_lock)
+        {
+            return _states.TryGetValue(topic, out var state) && state.Connected;
+        }
+    }
+
+    public (int Active, int Total) GetStatus(IEnumerable<string> topics)
+    {
+        lock (_lock)
+        {
+            var topicList = topics.ToList();
+            var active = topicList.Count(t => _states.TryGetValue(t, out var s) && s.Connected);
+            return (active, topicList.Count);
+        }
+    }
+
+    public IReadOnlyDictionary<string, TopicState> GetAllStates()
+    {
+        lock (_lock)
+        {
+            return new Dictionary<string, TopicState>(_states);
+        }
+    }
+
     public void NoteMessage(string topic, string? messageId, long messageTime)
     {
         lock (_lock)
