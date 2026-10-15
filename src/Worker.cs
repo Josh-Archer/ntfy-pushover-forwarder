@@ -148,7 +148,7 @@ public class Worker : BackgroundService
         }
     }
 
-    private async Task SendRecoveryAlertAsync(string topic, CancellationToken stoppingToken)
+    internal async Task SendRecoveryAlertAsync(string topic, CancellationToken stoppingToken)
     {
         try
         {
@@ -173,7 +173,7 @@ public class Worker : BackgroundService
             };
 
             var client = _httpClientFactory.CreateClient("PushoverClient");
-            var response = await client.PostAsync(_options.PushoverUrl, content, stoppingToken);
+            using var response = await client.PostAsync(_options.PushoverUrl, content, stoppingToken);
             if (response.IsSuccessStatusCode)
             {
                 _metrics.RecoveryAlert(topic);
@@ -327,7 +327,7 @@ public class Worker : BackgroundService
 
                     await AttachImageAsync(content, topic, message, tags, stoppingToken);
 
-                    var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
+                    using var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -431,7 +431,7 @@ public class Worker : BackgroundService
         }
 
         byte[]? fileBytes = null;
-        string fileName = "image.png";
+        string fileName = isLogo ? "logo.png" : "attachment.png";
         string mediaType = "image/png";
 
         if (isLogo && _iconCache.TryGetValue(attUrl, out var cachedBytes))
@@ -450,24 +450,79 @@ public class Worker : BackgroundService
                     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.NtfyToken);
                 }
 
-                using var attResponse = await client.SendAsync(request, stoppingToken);
-                if (attResponse.IsSuccessStatusCode)
-                {
-                    fileBytes = await attResponse.Content.ReadAsByteArrayAsync(stoppingToken);
-                    mediaType = attResponse.Content.Headers.ContentType?.MediaType ?? (isLogo ? "image/png" : "image/jpeg");
-                    fileName = isLogo ? "logo.png" : "attachment" + (mediaType.Contains("png", StringComparison.Ordinal) ? ".png" : ".jpg");
-
-                    if (isLogo)
-                    {
-                        _iconCache[attUrl] = fileBytes;
-                    }
-                }
-                else
+                using var attResponse = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, stoppingToken);
+                if (!attResponse.IsSuccessStatusCode)
                 {
                     _logger.LogWarning("Failed to download attachment/logo from {Url}: HTTP {StatusCode}", attUrl, attResponse.StatusCode);
+                    return;
+                }
+
+                var rawMediaType = attResponse.Content.Headers.ContentType?.MediaType;
+                if (string.IsNullOrEmpty(rawMediaType))
+                {
+                    if (isLogo)
+                    {
+                        rawMediaType = "image/png";
+                    }
+                    else if (!string.IsNullOrEmpty(message.Attachment?.Type))
+                    {
+                        rawMediaType = message.Attachment.Type;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(rawMediaType) || !rawMediaType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning("Skipping attachment from {Url}: unsupported content type '{ContentType}'.", attUrl, rawMediaType ?? "none");
+                    return;
+                }
+
+                mediaType = rawMediaType;
+
+                var maxBytes = _options.MaxAttachmentBytes < 0 ? 2621440 : _options.MaxAttachmentBytes;
+
+                if (attResponse.Content.Headers.ContentLength.HasValue && attResponse.Content.Headers.ContentLength.Value > maxBytes)
+                {
+                    _logger.LogWarning(
+                        "Skipping attachment from {Url}: Content-Length {ContentLength} exceeds maximum allowed size of {MaxBytes} bytes.",
+                        attUrl, attResponse.Content.Headers.ContentLength.Value, maxBytes);
+                    return;
+                }
+
+                using var stream = await attResponse.Content.ReadAsStreamAsync(stoppingToken);
+                using var ms = new MemoryStream();
+                byte[] buffer = new byte[81920];
+                long totalBytesRead = 0;
+                int bytesRead;
+
+                while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, stoppingToken)) > 0)
+                {
+                    totalBytesRead += bytesRead;
+                    if (totalBytesRead > maxBytes)
+                    {
+                        _logger.LogWarning(
+                            "Skipping attachment from {Url}: size exceeded maximum allowed limit of {MaxBytes} bytes while streaming.",
+                            attUrl, maxBytes);
+                        return;
+                    }
+
+                    ms.Write(buffer, 0, bytesRead);
+                }
+
+                if (ms.Length == 0)
+                {
+                    _logger.LogWarning("Skipping attachment from {Url}: downloaded content is empty.", attUrl);
+                    return;
+                }
+
+                fileBytes = ms.ToArray();
+                fileName = isLogo ? "logo.png" : "attachment" + (mediaType.Contains("png", StringComparison.OrdinalIgnoreCase) ? ".png" : ".jpg");
+
+                if (isLogo)
+                {
+                    _iconCache[attUrl] = fileBytes;
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
             {
                 _logger.LogError(ex, "Failed to download attachment/logo from {Url}", attUrl);
             }
