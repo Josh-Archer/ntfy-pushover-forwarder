@@ -2,6 +2,7 @@ using System.Diagnostics.Metrics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using NtfyPushoverForwarder;
@@ -39,6 +40,31 @@ public class CursorAdvanceTests
     {
         public Meter Create(MeterOptions options) => new(options.Name, options.Version);
         public void Dispose() { }
+    }
+
+    private sealed class TestCallbackLogger<T> : ILogger<T>
+    {
+        private readonly Action<LogLevel, string> _callback;
+
+        public TestCallbackLogger(Action<LogLevel, string> callback)
+        {
+            _callback = callback;
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter != null ? formatter(state, exception) : state?.ToString() ?? string.Empty;
+            _callback(logLevel, message);
+        }
     }
 
     private static (Worker Worker, TopicConnectionTracker Connections) Create(
@@ -113,12 +139,13 @@ public class CursorAdvanceTests
         ForwarderOptions options,
         Func<HttpRequestMessage, HttpResponseMessage> handlerFunc,
         IDedupeStore? dedupeStore = null,
-        TopicConnectionTracker? connections = null)
+        TopicConnectionTracker? connections = null,
+        ILogger<Worker>? logger = null)
     {
         var tracker = connections ?? new TopicConnectionTracker();
         var store = dedupeStore ?? new InMemoryDedupeStore();
         var worker = new Worker(
-            NullLogger<Worker>.Instance,
+            logger ?? NullLogger<Worker>.Instance,
             new TestHttpClientFactory(new TestHttpMessageHandler(handlerFunc)),
             Options.Create(options),
             new ForwarderMetrics(new TestMeterFactory()),
@@ -784,13 +811,22 @@ public class CursorAdvanceTests
         var options = BaseOptions();
         options.MaxRetries = 1;
         options.RetryDelayMilliseconds = 0;
-        options.ReconnectInitialDelayMilliseconds = 1;
+        options.ReconnectInitialDelayMilliseconds = 60_000;
         options.SendRecoveryAlerts = false;
 
         var connections = new TopicConnectionTracker();
         var requestedNtfyUrls = new List<string>();
         int pushoverAttemptsA = 0;
         int pushoverAttemptsB = 0;
+        var streamEndedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var logger = new TestCallbackLogger<Worker>((logLevel, message) =>
+        {
+            if (message.Contains("SSE stream ended"))
+            {
+                streamEndedTcs.TrySetResult(true);
+            }
+        });
 
         var (worker, _, _) = CreateWithHandler(options, req =>
         {
@@ -835,19 +871,12 @@ public class CursorAdvanceTests
             {
                 Content = new StringContent("{\"status\":1}")
             };
-        }, connections: connections);
+        }, connections: connections, logger: logger);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         var listenTask = worker.ListenToTopicAsync("alerts", cts.Token);
 
-        while (!cts.IsCancellationRequested)
-        {
-            if (connections.GetSinceCursor("alerts") == "msg-valid")
-            {
-                break;
-            }
-            await Task.Delay(10);
-        }
+        await streamEndedTcs.Task.WaitAsync(cts.Token);
 
         cts.Cancel();
         try
