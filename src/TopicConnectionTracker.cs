@@ -16,6 +16,7 @@ public sealed class TopicConnectionTracker
         public DateTimeOffset? DisconnectedAt { get; set; }
         public string? LastMessageId { get; set; }
         public long? LastMessageTime { get; set; }
+        public List<string> UnresolvedMessageIds { get; } = new();
     }
 
     public TopicState GetOrCreate(string topic)
@@ -79,12 +80,44 @@ public sealed class TopicConnectionTracker
         }
     }
 
+    public void NoteMessageFailed(string topic, string? messageId)
+    {
+        if (string.IsNullOrWhiteSpace(messageId))
+        {
+            return;
+        }
+
+        lock (_lock)
+        {
+            var state = GetOrCreateUnsafe(topic);
+            if (!state.UnresolvedMessageIds.Contains(messageId))
+            {
+                state.UnresolvedMessageIds.Add(messageId);
+            }
+        }
+    }
+
     public void NoteMessage(string topic, string? messageId, long messageTime)
     {
         lock (_lock)
         {
             var state = GetOrCreateUnsafe(topic);
-            if (!string.IsNullOrWhiteSpace(messageId))
+            if (string.IsNullOrWhiteSpace(messageId))
+            {
+                if (messageTime > 0)
+                {
+                    state.LastMessageTime = messageTime;
+                }
+                return;
+            }
+
+            bool wasFirstUnresolved = state.UnresolvedMessageIds.Count > 0 &&
+                                      state.UnresolvedMessageIds[0] == messageId;
+
+            state.UnresolvedMessageIds.Remove(messageId);
+
+            // Advance cursor only if no earlier unresolved failures remain
+            if (state.UnresolvedMessageIds.Count == 0 || wasFirstUnresolved)
             {
                 state.LastMessageId = messageId;
             }

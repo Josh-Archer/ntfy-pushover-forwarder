@@ -32,4 +32,20 @@ public class ForwarderOptions
     public Dictionary<string, string> TopicTokens { get; set; } = new();
     public Dictionary<string, string> SoundMap { get; set; } = new();
     public Dictionary<string, string> LogoMap { get; set; } = new();
+
+    /// <summary>
+    /// Maximum number of delivery attempts for Pushover messages (1 initial attempt + retries for transient errors).
+    /// Defaults to 3.
+    /// </summary>
+    public int MaxRetries { get; set; } = 3;
+
+    /// <summary>
+    /// Delay between retry attempts in milliseconds. Defaults to 0.
+    /// </summary>
+    public int RetryDelayMilliseconds { get; set; } = 0;
+
+    /// <summary>
+    /// Initial delay in milliseconds before attempting to reconnect to ntfy SSE. Defaults to 1000.
+    /// </summary>
+    public int ReconnectInitialDelayMilliseconds { get; set; } = 1000;
 }

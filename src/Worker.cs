@@ -52,9 +52,12 @@ public class Worker : BackgroundService
         await Task.WhenAll(tasks);
     }
 
-    private async Task ListenToTopicAsync(string topic, CancellationToken stoppingToken)
+    internal async Task ListenToTopicAsync(string topic, CancellationToken stoppingToken)
     {
-        var reconnect = new SseReconnectPolicy();
+        var initialDelay = _options.ReconnectInitialDelayMilliseconds > 0
+            ? TimeSpan.FromMilliseconds(_options.ReconnectInitialDelayMilliseconds)
+            : TimeSpan.FromSeconds(1);
+        var reconnect = new SseReconnectPolicy(initialDelay);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -106,7 +109,14 @@ public class Worker : BackgroundService
 
                         if (message.Event == "message")
                         {
-                            await HandleMessageAsync(topic, message, stoppingToken);
+                            var handled = await HandleMessageAsync(topic, message, stoppingToken);
+                            if (!handled)
+                            {
+                                _logger.LogWarning(
+                                    "Transient failure handling message {MessageId} on topic {Topic}; stopping stream to reconnect and retry in order.",
+                                    message.Id, topic);
+                                break;
+                            }
                         }
                     }
                     catch (JsonException ex)
@@ -181,24 +191,47 @@ public class Worker : BackgroundService
     /// (successful forward or intentional drop). Failed Pushover posts leave the cursor
     /// unchanged so reconnect can retry.
     /// </summary>
-    internal async Task HandleMessageAsync(string topic, NtfyMessage message, CancellationToken stoppingToken)
+    /// <returns>
+    /// True if the message was handled (successful forward, intentional drop, or permanent failure)
+    /// and stream processing should continue; false if a transient failure occurred and the stream
+    /// should be stopped to reconnect and retry.
+    /// </returns>
+    internal async Task<bool> HandleMessageAsync(string topic, NtfyMessage message, CancellationToken stoppingToken)
     {
-        var handled = await ForwardToPushoverAsync(topic, message, stoppingToken);
-        if (handled)
+        var result = await ForwardToPushoverAsync(topic, message, stoppingToken);
+        switch (result)
         {
-            _connections.NoteMessage(topic, message.Id, message.Time);
+            case ForwardResult.Success:
+                _connections.NoteMessage(topic, message.Id, message.Time);
+                return true;
+
+            case ForwardResult.PermanentFailure:
+                // Permanently invalid messages must not block the stream forever.
+                // Do not mark as unresolved transient failure, but do not advance cursor on its own either.
+                return true;
+
+            case ForwardResult.TransientFailure:
+            default:
+                _connections.NoteMessageFailed(topic, message.Id);
+                return false;
         }
     }
 
     /// <returns>
-    /// True when the cursor should advance (forwarded or intentionally dropped);
-    /// false when forwarding failed and the message should be retried after reconnect.
+    /// ForwardResult indicating Success, TransientFailure, or PermanentFailure.
     /// </returns>
-    internal async Task<bool> ForwardToPushoverAsync(string topic, NtfyMessage message, CancellationToken stoppingToken)
+    internal async Task<ForwardResult> ForwardToPushoverAsync(string topic, NtfyMessage message, CancellationToken stoppingToken)
     {
         try
         {
             _metrics.Received(topic);
+
+            if (string.IsNullOrWhiteSpace(message.Id))
+            {
+                _logger.LogError("Message has no Id on topic {Topic}", topic);
+                _metrics.ForwardFailed(topic);
+                return ForwardResult.PermanentFailure;
+            }
 
             var title = !string.IsNullOrEmpty(message.Title) ? message.Title : $"ntfy: {topic}";
             var msgBody = !string.IsNullOrEmpty(message.Message) ? message.Message : "No message body";
@@ -211,7 +244,7 @@ public class Worker : BackgroundService
                     "Message dropped due to low priority ({Priority} < {MinimumPriority}).",
                     PriorityMapper.ResolveNtfyPriority(message.Priority),
                     _options.MinimumPriority);
-                return true;
+                return ForwardResult.Success;
             }
 
             var fingerprint = MessageFingerprint.Build(topic, title, msgBody, tags, message);
@@ -220,7 +253,7 @@ public class Worker : BackgroundService
             {
                 _metrics.DroppedDedupe(topic);
                 _logger.LogInformation("Duplicate ntfy message suppressed for topic {Topic}: {Title}", topic, title);
-                return true;
+                return ForwardResult.Success;
             }
 
             var priority = PriorityMapper.ToPushover(message.Priority);
@@ -230,11 +263,11 @@ public class Worker : BackgroundService
                 token = _options.PushoverDefaultToken;
             }
 
-            if (string.IsNullOrEmpty(token))
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(_options.PushoverUserKey))
             {
-                _logger.LogError("No Pushover token available for topic {Topic}", topic);
+                _logger.LogError("No Pushover token or user key available for topic {Topic}", topic);
                 _metrics.ForwardFailed(topic);
-                return false;
+                return ForwardResult.PermanentFailure;
             }
 
             string sound = "pushover";
@@ -254,58 +287,100 @@ public class Worker : BackgroundService
 
             _logger.LogInformation("Forwarding {Topic} [{Sound}]: {Title}", topic, sound, title);
 
-            using var content = new MultipartFormDataContent();
-            content.Add(new StringContent(token), "token");
-            content.Add(new StringContent(_options.PushoverUserKey), "user");
-            content.Add(new StringContent(title), "title");
-            content.Add(new StringContent(formattedBody), "message");
-            content.Add(new StringContent(priority.ToString()), "priority");
-            content.Add(new StringContent(sound), "sound");
-
-            if (useHtml)
-            {
-                content.Add(new StringContent("1"), "html");
-            }
-
-            if (!string.IsNullOrEmpty(device))
-            {
-                content.Add(new StringContent(device), "device");
-            }
-
-            if (!string.IsNullOrEmpty(message.Click))
-            {
-                content.Add(new StringContent(message.Click), "url");
-            }
-
-            if (priority == 2)
-            {
-                content.Add(new StringContent("60"), "retry");
-                content.Add(new StringContent("3600"), "expire");
-            }
-
-            await AttachImageAsync(content, topic, message, tags, stoppingToken);
-
             var pushoverClient = _httpClientFactory.CreateClient("PushoverClient");
-            var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
+            var maxAttempts = Math.Max(1, _options.MaxRetries);
+            int attempts = 0;
 
-            if (!response.IsSuccessStatusCode)
+            while (attempts < maxAttempts)
             {
-                var responseBody = await response.Content.ReadAsStringAsync(stoppingToken);
-                _logger.LogError("Pushover API Error {StatusCode}: {ResponseBody}", response.StatusCode, responseBody);
-                _metrics.ForwardFailed(topic);
-                return false;
+                attempts++;
+                try
+                {
+                    using var content = new MultipartFormDataContent();
+                    content.Add(new StringContent(token), "token");
+                    content.Add(new StringContent(_options.PushoverUserKey), "user");
+                    content.Add(new StringContent(title), "title");
+                    content.Add(new StringContent(formattedBody), "message");
+                    content.Add(new StringContent(priority.ToString()), "priority");
+                    content.Add(new StringContent(sound), "sound");
+
+                    if (useHtml)
+                    {
+                        content.Add(new StringContent("1"), "html");
+                    }
+
+                    if (!string.IsNullOrEmpty(device))
+                    {
+                        content.Add(new StringContent(device), "device");
+                    }
+
+                    if (!string.IsNullOrEmpty(message.Click))
+                    {
+                        content.Add(new StringContent(message.Click), "url");
+                    }
+
+                    if (priority == 2)
+                    {
+                        content.Add(new StringContent("60"), "retry");
+                        content.Add(new StringContent("3600"), "expire");
+                    }
+
+                    await AttachImageAsync(content, topic, message, tags, stoppingToken);
+
+                    var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        // Only suppress duplicates after a successful forward.
+                        _dedupeStore.TryRecord(fingerprint, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries);
+                        _metrics.Forwarded(topic);
+                        return ForwardResult.Success;
+                    }
+
+                    var responseBody = await response.Content.ReadAsStringAsync(stoppingToken);
+
+                    // Check if permanent error: HTTP 4xx except 429 Too Many Requests
+                    if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500 && response.StatusCode != System.Net.HttpStatusCode.TooManyRequests)
+                    {
+                        _logger.LogError("Pushover API Permanent Error {StatusCode}: {ResponseBody}", response.StatusCode, responseBody);
+                        _metrics.ForwardFailed(topic);
+                        return ForwardResult.PermanentFailure;
+                    }
+
+                    _logger.LogWarning("Pushover API Error {StatusCode} (attempt {Attempt}/{MaxAttempts}): {ResponseBody}",
+                        response.StatusCode, attempts, maxAttempts, responseBody);
+
+                    if (attempts < maxAttempts && _options.RetryDelayMilliseconds > 0)
+                    {
+                        await Task.Delay(_options.RetryDelayMilliseconds, stoppingToken);
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning(ex, "Exception forwarding message to Pushover for topic {Topic} (attempt {Attempt}/{MaxAttempts})",
+                        topic, attempts, maxAttempts);
+
+                    if (attempts >= maxAttempts)
+                    {
+                        _metrics.ForwardFailed(topic);
+                        return ForwardResult.TransientFailure;
+                    }
+
+                    if (_options.RetryDelayMilliseconds > 0)
+                    {
+                        await Task.Delay(_options.RetryDelayMilliseconds, stoppingToken);
+                    }
+                }
             }
 
-            // Only suppress duplicates after a successful forward.
-            _dedupeStore.TryRecord(fingerprint, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries);
-            _metrics.Forwarded(topic);
-            return true;
+            _metrics.ForwardFailed(topic);
+            return ForwardResult.TransientFailure;
         }
         catch (Exception ex)
         {
             _metrics.ForwardFailed(topic);
             _logger.LogError(ex, "Error forwarding message to Pushover for topic {Topic}", topic);
-            return false;
+            return ForwardResult.TransientFailure;
         }
     }
 
