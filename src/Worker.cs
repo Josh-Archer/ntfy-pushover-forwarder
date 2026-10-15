@@ -163,7 +163,7 @@ public class Worker : BackgroundService
             };
 
             var client = _httpClientFactory.CreateClient("PushoverClient");
-            var response = await client.PostAsync(_options.PushoverUrl, content, stoppingToken);
+            using var response = await client.PostAsync(_options.PushoverUrl, content, stoppingToken);
             if (response.IsSuccessStatusCode)
             {
                 _metrics.RecoveryAlert(topic);
@@ -286,7 +286,7 @@ public class Worker : BackgroundService
             await AttachImageAsync(content, topic, message, tags, stoppingToken);
 
             var pushoverClient = _httpClientFactory.CreateClient("PushoverClient");
-            var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
+            using var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -375,16 +375,25 @@ public class Worker : BackgroundService
                     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.NtfyToken);
                 }
 
-                using var attResponse = await client.SendAsync(request, stoppingToken);
+                using var attResponse = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, stoppingToken);
                 if (attResponse.IsSuccessStatusCode)
                 {
-                    fileBytes = await attResponse.Content.ReadAsByteArrayAsync(stoppingToken);
-                    mediaType = attResponse.Content.Headers.ContentType?.MediaType ?? (isLogo ? "image/png" : "image/jpeg");
-                    fileName = isLogo ? "logo.png" : "attachment" + (mediaType.Contains("png", StringComparison.Ordinal) ? ".png" : ".jpg");
-
-                    if (isLogo)
+                    fileBytes = await ReadBoundedContentAsync(attResponse.Content, _options.MaxAttachmentBytes, stoppingToken);
+                    if (fileBytes == null)
                     {
-                        _iconCache[attUrl] = fileBytes;
+                        _logger.LogWarning(
+                            "Skipping oversized attachment/logo from {Url}: exceeds {MaxAttachmentBytes} bytes",
+                            attUrl, _options.MaxAttachmentBytes);
+                    }
+                    else
+                    {
+                        mediaType = attResponse.Content.Headers.ContentType?.MediaType ?? (isLogo ? "image/png" : "image/jpeg");
+                        fileName = isLogo ? "logo.png" : "attachment" + (mediaType.Contains("png", StringComparison.Ordinal) ? ".png" : ".jpg");
+
+                        if (isLogo)
+                        {
+                            _iconCache[attUrl] = fileBytes;
+                        }
                     }
                 }
                 else
@@ -404,6 +413,38 @@ public class Worker : BackgroundService
             fileContent.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
             content.Add(fileContent, "attachment", fileName);
         }
+    }
+
+    /// <summary>
+    /// Streams HTTP content while enforcing a hard byte cap. Returns the buffered
+    /// bytes when the content fits, or null when it exceeds <paramref name="maxBytes"/>.
+    /// Bytes are counted while streaming, so a missing or misleading Content-Length
+    /// header cannot bypass the limit.
+    /// </summary>
+    internal static async Task<byte[]?> ReadBoundedContentAsync(HttpContent content, long maxBytes, CancellationToken cancellationToken)
+    {
+        if (content.Headers.ContentLength is { } declaredLength && declaredLength > maxBytes)
+        {
+            return null;
+        }
+
+        await using var stream = await content.ReadAsStreamAsync(cancellationToken);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[81920];
+        long total = 0;
+        int read;
+        while ((read = await stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)) > 0)
+        {
+            total += read;
+            if (total > maxBytes)
+            {
+                return null;
+            }
+
+            buffer.Write(chunk, 0, read);
+        }
+
+        return buffer.ToArray();
     }
 
     internal static bool IsSameOrigin(string? targetUrl, string? baseUrl)

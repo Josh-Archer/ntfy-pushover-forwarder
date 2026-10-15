@@ -32,4 +32,11 @@ public class ForwarderOptions
     public Dictionary<string, string> TopicTokens { get; set; } = new();
     public Dictionary<string, string> SoundMap { get; set; } = new();
     public Dictionary<string, string> LogoMap { get; set; } = new();
+
+    /// <summary>
+    /// Maximum attachment download size in bytes. Attachments exceeding this limit
+    /// are skipped while the text alert is still forwarded. Default matches
+    /// Pushover's 5 MB attachment limit. Configurable via Forwarder__MaxAttachmentBytes.
+    /// </summary>
+    public long MaxAttachmentBytes { get; set; } = 5 * 1024 * 1024;
 }

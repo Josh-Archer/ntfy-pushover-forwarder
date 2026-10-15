@@ -414,6 +414,195 @@ public class AttachmentDownloadTests
         Assert.Contains(content, c => c.Headers.ContentDisposition?.Name == "attachment");
     }
 
+    [Fact]
+    public async Task AttachImageAsync_WithOversizedContentLength_SkipsAttachment()
+    {
+        var options = new ForwarderOptions
+        {
+            NtfyUrl = "http://ntfy.example.test",
+            MaxAttachmentBytes = 1024
+        };
+
+        var handler = new TestHttpMessageHandler(req =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(new byte[16])
+            };
+            response.Content.Headers.ContentLength = options.MaxAttachmentBytes + 1;
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+            return response;
+        });
+
+        var worker = CreateWorker(options, handler);
+        using var content = new MultipartFormDataContent();
+        var message = new NtfyMessage
+        {
+            Attachment = new NtfyAttachment
+            {
+                Url = "http://ntfy.example.test/file/big.png"
+            }
+        };
+
+        await worker.AttachImageAsync(content, "test-topic", message, Array.Empty<string>(), CancellationToken.None);
+
+        Assert.DoesNotContain(content, c => c.Headers.ContentDisposition?.Name == "attachment");
+    }
+
+    [Fact]
+    public async Task AttachImageAsync_WithMisleadingContentLength_AbortsOversizedStream()
+    {
+        // Declared Content-Length is small, but the body is actually over the limit:
+        // the byte count measured while streaming must still enforce the cap.
+        var options = new ForwarderOptions
+        {
+            NtfyUrl = "http://ntfy.example.test",
+            MaxAttachmentBytes = 1024
+        };
+
+        var handler = new TestHttpMessageHandler(req =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(new byte[options.MaxAttachmentBytes + 1])
+            };
+            response.Content.Headers.ContentLength = 16;
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+            return response;
+        });
+
+        var worker = CreateWorker(options, handler);
+        using var content = new MultipartFormDataContent();
+        var message = new NtfyMessage
+        {
+            Attachment = new NtfyAttachment
+            {
+                Url = "http://ntfy.example.test/file/big.png"
+            }
+        };
+
+        await worker.AttachImageAsync(content, "test-topic", message, Array.Empty<string>(), CancellationToken.None);
+
+        Assert.DoesNotContain(content, c => c.Headers.ContentDisposition?.Name == "attachment");
+    }
+
+    [Fact]
+    public async Task AttachImageAsync_WithNormalAttachment_AddsAttachment()
+    {
+        var options = new ForwarderOptions
+        {
+            NtfyUrl = "http://ntfy.example.test",
+            MaxAttachmentBytes = 1024
+        };
+
+        var payload = new byte[] { 0x89, 0x50, 0x4E, 0x47 };
+        var handler = new TestHttpMessageHandler(req =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(payload)
+            };
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+            return response;
+        });
+
+        var worker = CreateWorker(options, handler);
+        using var content = new MultipartFormDataContent();
+        var message = new NtfyMessage
+        {
+            Attachment = new NtfyAttachment
+            {
+                Url = "http://ntfy.example.test/file/small.png"
+            }
+        };
+
+        await worker.AttachImageAsync(content, "test-topic", message, Array.Empty<string>(), CancellationToken.None);
+
+        Assert.Contains(content, c => c.Headers.ContentDisposition?.Name == "attachment");
+    }
+
+    [Fact]
+    public async Task AttachImageAsync_WhenDownloadThrows_DoesNotAddAttachment()
+    {
+        var options = new ForwarderOptions
+        {
+            NtfyUrl = "http://ntfy.example.test"
+        };
+
+        var handler = new TestHttpMessageHandler(req => throw new HttpRequestException("connection reset"));
+
+        var worker = CreateWorker(options, handler);
+        using var content = new MultipartFormDataContent();
+        var message = new NtfyMessage
+        {
+            Attachment = new NtfyAttachment
+            {
+                Url = "http://ntfy.example.test/file/photo.png"
+            }
+        };
+
+        // Must not throw: the text alert path stays intact when the download fails.
+        await worker.AttachImageAsync(content, "test-topic", message, Array.Empty<string>(), CancellationToken.None);
+
+        Assert.DoesNotContain(content, c => c.Headers.ContentDisposition?.Name == "attachment");
+    }
+
+    private sealed class TrackingResponseMessage : HttpResponseMessage
+    {
+        public bool Disposed { get; private set; }
+
+        public TrackingResponseMessage(HttpStatusCode statusCode) : base(statusCode)
+        {
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
+    [Fact]
+    public async Task ForwardToPushoverAsync_DisposesPushoverResponse()
+    {
+        var options = new ForwarderOptions
+        {
+            NtfyUrl = "http://ntfy.example.test",
+            PushoverUrl = "https://pushover.example.test/1/messages.json",
+            PushoverUserKey = "test-user-key",
+            PushoverDefaultToken = "test-app-token",
+            MinimumPriority = 1,
+            Topics = new[] { "test-topic" }
+        };
+
+        TrackingResponseMessage? tracked = null;
+        var handler = new TestHttpMessageHandler(req =>
+        {
+            tracked = new TrackingResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"status\":1}")
+            };
+            return tracked;
+        });
+
+        var worker = CreateWorker(options, handler);
+        var message = new NtfyMessage
+        {
+            Id = "test-id",
+            Time = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            Event = "message",
+            Topic = "test-topic",
+            Title = "test title",
+            Message = "test body"
+        };
+
+        var handled = await worker.ForwardToPushoverAsync("test-topic", message, CancellationToken.None);
+
+        Assert.True(handled);
+        Assert.NotNull(tracked);
+        Assert.True(tracked.Disposed);
+    }
+
     [Theory]
     [InlineData("http://ntfy.example.test/file.png", "http://ntfy.example.test", true)]
     [InlineData("http://ntfy.example.test/file.png", "http://ntfy.example.test:80", true)]
