@@ -34,6 +34,11 @@ public class ForwarderOptions
     public Dictionary<string, string> LogoMap { get; set; } = new();
 
     /// <summary>
+    /// Maximum attachment size in bytes. Defaults to 2621440 (2.5 MB, Pushover limit).
+    /// </summary>
+    public long MaxAttachmentBytes { get; set; } = 2621440;
+
+    /// <summary>
     /// Maximum number of delivery attempts for Pushover messages (1 initial attempt + retries for transient errors).
     /// Defaults to 3.
     /// </summary>
