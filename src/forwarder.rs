@@ -65,13 +65,20 @@ impl Forwarder {
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
         };
+        let store = Store::load(&config);
         let topics = config
             .topics
             .iter()
-            .map(|t| (t.clone(), TopicState::default()))
+            .map(|t| {
+                let state = TopicState {
+                    cursor: store.cursor(t).map(str::to_owned),
+                    ..TopicState::default()
+                };
+                (t.clone(), state)
+            })
             .collect();
         Ok(Arc::new(Self {
-            store: Mutex::new(Store::load(&config)),
+            store: Mutex::new(store),
             config,
             topics: Mutex::new(topics),
             icons: Mutex::new(HashMap::new()),
@@ -102,10 +109,7 @@ impl Forwarder {
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
-                    Delivery::Success => {
-                        self.topics.lock().await.get_mut(&topic).unwrap().cursor =
-                            Some(message.id.clone())
-                    }
+                    Delivery::Success => self.advance_cursor(&topic, &message.id).await,
                     Delivery::Permanent => {}
                 }
                 pending = None;
@@ -188,9 +192,7 @@ impl Forwarder {
                 continue;
             }
             match self.deliver(topic, &message).await {
-                Delivery::Success => {
-                    self.topics.lock().await.get_mut(topic).unwrap().cursor = Some(message.id)
-                }
+                Delivery::Success => self.advance_cursor(topic, &message.id).await,
                 Delivery::Permanent => {}
                 Delivery::Transient => {
                     *pending = Some(message);
@@ -248,6 +250,10 @@ impl Forwarder {
         self.count(topic, if result == Delivery::Success { 1 } else { 4 })
             .await;
         result
+    }
+    async fn advance_cursor(&self, topic: &str, cursor: &str) {
+        Store::set_cursor(&self.store, topic, cursor, &self.config).await;
+        self.topics.lock().await.get_mut(topic).unwrap().cursor = Some(cursor.into());
     }
     fn form(&self, topic: &str, message: &Message, image: Option<&Image>) -> Form {
         let (body, html) = message.formatted();

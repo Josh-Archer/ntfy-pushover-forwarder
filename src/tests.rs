@@ -146,6 +146,30 @@ async fn durable_dedupe_reads_dotnet_timestamps_and_bounds_entries() {
     std::fs::remove_file(path).unwrap();
 }
 #[tokio::test]
+async fn durable_cursors_restore_per_topic_after_restart() {
+    let dir = std::env::temp_dir().join(format!("ntfy-cursors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dedupe.json");
+    let cfg = Config {
+        deduplication_store_path: path.to_str().unwrap().into(),
+        ..config()
+    };
+    let store = tokio::sync::Mutex::new(Store::load(&cfg));
+    Store::set_cursor(&store, "alerts", "ntfy-id-1", &cfg).await;
+    Store::set_cursor(&store, "other", "ntfy-id-2", &cfg).await;
+
+    let restarted = Store::load(&cfg);
+    assert_eq!(restarted.cursor("alerts"), Some("ntfy-id-1"));
+    assert_eq!(restarted.cursor("other"), Some("ntfy-id-2"));
+    assert_eq!(restarted.cursor("missing"), None);
+    let forwarder = Forwarder::new(cfg).unwrap();
+    assert_eq!(
+        forwarder.topics.lock().await["alerts"].cursor.as_deref(),
+        Some("ntfy-id-1")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
 async fn health_and_metrics_report_per_topic_state() {
     let app = Forwarder::new(Config {
         topics: vec!["a".into(), "b".into()],

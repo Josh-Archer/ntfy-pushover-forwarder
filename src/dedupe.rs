@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 #[derive(Default)]
 pub struct Store {
     entries: HashMap<String, DateTime<Utc>>,
+    cursors: HashMap<String, String>,
     in_flight: HashSet<String>,
 }
 #[derive(Debug, PartialEq)]
@@ -29,9 +30,46 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => tracing::warn!("Cannot read dedupe file; starting empty"),
             }
+            let cursor_path = cursor_path(config);
+            match std::fs::read(&cursor_path) {
+                Ok(data) => match serde_json::from_slice(&data) {
+                    Ok(cursors) => store.cursors = cursors,
+                    Err(_) => {
+                        tracing::warn!(path = %cursor_path.display(), "Invalid cursor file; starting without saved cursors")
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    tracing::warn!(path = %cursor_path.display(), "Cannot read cursor file; starting without saved cursors")
+                }
+            }
         }
         store.prune(config, Utc::now());
         store
+    }
+    pub fn cursor(&self, topic: &str) -> Option<&str> {
+        self.cursors.get(topic).map(String::as_str)
+    }
+    pub async fn set_cursor(store: &Mutex<Self>, topic: &str, cursor: &str, config: &Config) {
+        let mut store = store.lock().await;
+        store.cursors.insert(topic.into(), cursor.into());
+        if config.deduplication_store_path.is_empty() {
+            return;
+        }
+        let path = cursor_path(config);
+        let result = async {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let temp = format!("{}.tmp", path.display());
+            tokio::fs::write(&temp, serde_json::to_vec(&store.cursors)?).await?;
+            tokio::fs::rename(temp, path).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if result.is_err() {
+            tracing::warn!("Cannot persist cursor file");
+        }
     }
     pub fn begin(&mut self, key: &str, config: &Config, now: DateTime<Utc>) -> Claim {
         if config.deduplication_window_seconds <= 0 {
@@ -92,4 +130,8 @@ impl Store {
             }
         }
     }
+}
+fn cursor_path(config: &Config) -> std::path::PathBuf {
+    let dedupe = Path::new(&config.deduplication_store_path);
+    dedupe.with_file_name("cursors.json")
 }
