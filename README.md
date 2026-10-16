@@ -111,6 +111,6 @@ On Linux, measure four idle topic subscriptions followed by 1,000 text messages,
 python3 scripts/integration.py --benchmark -- "$PWD/target/release/ntfy-pushover-forwarder"
 ```
 
-Add `--persistent` to include a dedupe file write after each delivery. See [measured results](docs/resource-comparison.md) and raw runs for the .NET comparison.
+Add `--persistent` to include a dedupe file write after each delivery. See [measured results](docs/resource-comparison.md), [cluster validation](docs/cluster-validation-2026-10-16.md), and raw runs for the .NET comparison.
 
 The harness reports RSS and process CPU seconds using `/proc`, plus wall time. The same command can run a published .NET baseline by passing its `dotnet` executable and DLL instead. These local measurements do not establish production savings; remeasure container CPU/memory with representative traffic before reducing Kubernetes limits.
