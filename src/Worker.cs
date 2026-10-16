@@ -249,13 +249,6 @@ public class Worker : BackgroundService
 
             var fingerprint = MessageFingerprint.Build(topic, title, msgBody, tags, message);
             var window = TimeSpan.FromSeconds(_options.DeduplicationWindowSeconds);
-            if (_dedupeStore.Contains(fingerprint, DateTimeOffset.UtcNow, window))
-            {
-                _metrics.DroppedDedupe(topic);
-                _logger.LogInformation("Duplicate ntfy message suppressed for topic {Topic}: {Title}", topic, title);
-                return ForwardResult.Success;
-            }
-
             var priority = PriorityMapper.ToPushover(message.Priority);
 
             if (!_options.TopicTokens.TryGetValue(topic, out var token) || string.IsNullOrEmpty(token))
@@ -284,97 +277,118 @@ public class Worker : BackgroundService
 
             var formattedBody = MessageFormatting.ApplyFormatting(msgBody, message);
             var useHtml = MessageFormatting.ShouldUseHtml(message, formattedBody);
+            var pushoverClient = _httpClientFactory.CreateClient("PushoverClient");
+            var maxAttempts = Math.Max(1, _options.MaxRetries);
+
+            var dedupeAttempt = _dedupeStore.TryBegin(fingerprint, DateTimeOffset.UtcNow, window);
+            if (dedupeAttempt == DedupeAttemptResult.Duplicate)
+            {
+                _metrics.DroppedDedupe(topic);
+                _logger.LogInformation("Duplicate ntfy message suppressed for topic {Topic}: {Title}", topic, title);
+                return ForwardResult.Success;
+            }
+
+            if (dedupeAttempt == DedupeAttemptResult.InProgress)
+            {
+                _logger.LogInformation("ntfy message delivery already in progress for topic {Topic}: {Title}", topic, title);
+                return ForwardResult.TransientFailure;
+            }
 
             _logger.LogInformation("Forwarding {Topic} [{Sound}]: {Title}", topic, sound, title);
 
-            var pushoverClient = _httpClientFactory.CreateClient("PushoverClient");
-            var maxAttempts = Math.Max(1, _options.MaxRetries);
             int attempts = 0;
+            var succeeded = false;
 
-            while (attempts < maxAttempts)
+            try
             {
-                attempts++;
-                try
+                while (attempts < maxAttempts)
                 {
-                    using var content = new MultipartFormDataContent();
-                    content.Add(new StringContent(token), "token");
-                    content.Add(new StringContent(_options.PushoverUserKey), "user");
-                    content.Add(new StringContent(title), "title");
-                    content.Add(new StringContent(formattedBody), "message");
-                    content.Add(new StringContent(priority.ToString()), "priority");
-                    content.Add(new StringContent(sound), "sound");
-
-                    if (useHtml)
+                    attempts++;
+                    try
                     {
-                        content.Add(new StringContent("1"), "html");
+                        using var content = new MultipartFormDataContent();
+                        content.Add(new StringContent(token), "token");
+                        content.Add(new StringContent(_options.PushoverUserKey), "user");
+                        content.Add(new StringContent(title), "title");
+                        content.Add(new StringContent(formattedBody), "message");
+                        content.Add(new StringContent(priority.ToString()), "priority");
+                        content.Add(new StringContent(sound), "sound");
+
+                        if (useHtml)
+                        {
+                            content.Add(new StringContent("1"), "html");
+                        }
+
+                        if (!string.IsNullOrEmpty(device))
+                        {
+                            content.Add(new StringContent(device), "device");
+                        }
+
+                        if (!string.IsNullOrEmpty(message.Click))
+                        {
+                            content.Add(new StringContent(message.Click), "url");
+                        }
+
+                        if (priority == 2)
+                        {
+                            content.Add(new StringContent("60"), "retry");
+                            content.Add(new StringContent("3600"), "expire");
+                        }
+
+                        await AttachImageAsync(content, topic, message, tags, stoppingToken);
+
+                        using var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            succeeded = true;
+                            _metrics.Forwarded(topic);
+                            return ForwardResult.Success;
+                        }
+
+                        var responseBody = await response.Content.ReadAsStringAsync(stoppingToken);
+
+                        // Check if permanent error: HTTP 4xx except 429 Too Many Requests
+                        if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500 && response.StatusCode != System.Net.HttpStatusCode.TooManyRequests)
+                        {
+                            _logger.LogError("Pushover API Permanent Error {StatusCode}: {ResponseBody}", response.StatusCode, responseBody);
+                            _metrics.ForwardFailed(topic);
+                            return ForwardResult.PermanentFailure;
+                        }
+
+                        _logger.LogWarning("Pushover API Error {StatusCode} (attempt {Attempt}/{MaxAttempts}): {ResponseBody}",
+                            response.StatusCode, attempts, maxAttempts, responseBody);
+
+                        if (attempts < maxAttempts && _options.RetryDelayMilliseconds > 0)
+                        {
+                            await Task.Delay(_options.RetryDelayMilliseconds, stoppingToken);
+                        }
                     }
-
-                    if (!string.IsNullOrEmpty(device))
+                    catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
                     {
-                        content.Add(new StringContent(device), "device");
-                    }
+                        _logger.LogWarning(ex, "Exception forwarding message to Pushover for topic {Topic} (attempt {Attempt}/{MaxAttempts})",
+                            topic, attempts, maxAttempts);
 
-                    if (!string.IsNullOrEmpty(message.Click))
-                    {
-                        content.Add(new StringContent(message.Click), "url");
-                    }
+                        if (attempts >= maxAttempts)
+                        {
+                            _metrics.ForwardFailed(topic);
+                            return ForwardResult.TransientFailure;
+                        }
 
-                    if (priority == 2)
-                    {
-                        content.Add(new StringContent("60"), "retry");
-                        content.Add(new StringContent("3600"), "expire");
-                    }
-
-                    await AttachImageAsync(content, topic, message, tags, stoppingToken);
-
-                    using var response = await pushoverClient.PostAsync(_options.PushoverUrl, content, stoppingToken);
-
-                    if (response.IsSuccessStatusCode)
-                    {
-                        // Only suppress duplicates after a successful forward.
-                        _dedupeStore.TryRecord(fingerprint, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries);
-                        _metrics.Forwarded(topic);
-                        return ForwardResult.Success;
-                    }
-
-                    var responseBody = await response.Content.ReadAsStringAsync(stoppingToken);
-
-                    // Check if permanent error: HTTP 4xx except 429 Too Many Requests
-                    if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500 && response.StatusCode != System.Net.HttpStatusCode.TooManyRequests)
-                    {
-                        _logger.LogError("Pushover API Permanent Error {StatusCode}: {ResponseBody}", response.StatusCode, responseBody);
-                        _metrics.ForwardFailed(topic);
-                        return ForwardResult.PermanentFailure;
-                    }
-
-                    _logger.LogWarning("Pushover API Error {StatusCode} (attempt {Attempt}/{MaxAttempts}): {ResponseBody}",
-                        response.StatusCode, attempts, maxAttempts, responseBody);
-
-                    if (attempts < maxAttempts && _options.RetryDelayMilliseconds > 0)
-                    {
-                        await Task.Delay(_options.RetryDelayMilliseconds, stoppingToken);
+                        if (_options.RetryDelayMilliseconds > 0)
+                        {
+                            await Task.Delay(_options.RetryDelayMilliseconds, stoppingToken);
+                        }
                     }
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
-                {
-                    _logger.LogWarning(ex, "Exception forwarding message to Pushover for topic {Topic} (attempt {Attempt}/{MaxAttempts})",
-                        topic, attempts, maxAttempts);
 
-                    if (attempts >= maxAttempts)
-                    {
-                        _metrics.ForwardFailed(topic);
-                        return ForwardResult.TransientFailure;
-                    }
-
-                    if (_options.RetryDelayMilliseconds > 0)
-                    {
-                        await Task.Delay(_options.RetryDelayMilliseconds, stoppingToken);
-                    }
-                }
+                _metrics.ForwardFailed(topic);
+                return ForwardResult.TransientFailure;
             }
-
-            _metrics.ForwardFailed(topic);
-            return ForwardResult.TransientFailure;
+            finally
+            {
+                _dedupeStore.Complete(fingerprint, succeeded, DateTimeOffset.UtcNow, window, _options.DeduplicationMaxEntries);
+            }
         }
         catch (Exception ex)
         {
