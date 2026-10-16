@@ -126,6 +126,12 @@ impl Config {
             "Topic names cannot contain /, ? or #"
         );
         ensure!(
+            config.deduplication_store_path.is_empty()
+                || Path::new(&config.deduplication_store_path).file_name()
+                    != Some(std::ffi::OsStr::new("cursors.json")),
+            "DeduplicationStorePath cannot be named cursors.json"
+        );
+        ensure!(
             !config.pushover_user_key.is_empty(),
             "PushoverUserKey is required"
         );

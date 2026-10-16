@@ -2,6 +2,8 @@ use crate::config::Config;
 use chrono::{DateTime, Utc};
 use std::{
     collections::{HashMap, HashSet},
+    fs::{self, OpenOptions},
+    io::Write,
     path::Path,
 };
 use tokio::sync::Mutex;
@@ -57,16 +59,9 @@ impl Store {
             return;
         }
         let path = cursor_path(config);
-        let result = async {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let temp = format!("{}.tmp", path.display());
-            tokio::fs::write(&temp, serde_json::to_vec(&store.cursors)?).await?;
-            tokio::fs::rename(temp, path).await?;
-            anyhow::Ok(())
-        }
-        .await;
+        let result = serde_json::to_vec(&store.cursors)
+            .map_err(anyhow::Error::from)
+            .and_then(|data| atomic_write(&path, &data));
         if result.is_err() {
             tracing::warn!("Cannot persist cursor file");
         }
@@ -114,17 +109,10 @@ impl Store {
         store.entries.insert(key.into(), now);
         store.prune(config, now);
         if !config.deduplication_store_path.is_empty() {
-            let result = async {
-                let path = Path::new(&config.deduplication_store_path);
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                let temp = format!("{}.tmp", config.deduplication_store_path);
-                tokio::fs::write(&temp, serde_json::to_vec(&store.entries)?).await?;
-                tokio::fs::rename(temp, path).await?;
-                anyhow::Ok(())
-            }
-            .await;
+            let path = Path::new(&config.deduplication_store_path);
+            let result = serde_json::to_vec(&store.entries)
+                .map_err(anyhow::Error::from)
+                .and_then(|data| atomic_write(path, &data));
             if result.is_err() {
                 tracing::warn!("Cannot persist dedupe file");
             }
@@ -133,5 +121,36 @@ impl Store {
 }
 fn cursor_path(config: &Config) -> std::path::PathBuf {
     let dedupe = Path::new(&config.deduplication_store_path);
-    dedupe.with_file_name("cursors.json")
+    if dedupe
+        .file_name()
+        .is_some_and(|name| name == "cursors.json")
+    {
+        dedupe.with_file_name("forwarder-cursors.json")
+    } else {
+        dedupe.with_file_name("cursors.json")
+    }
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let temp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temp, path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }

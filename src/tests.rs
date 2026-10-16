@@ -52,6 +52,27 @@ fn config_rejects_missing_credentials_and_invalid_settings() {
     );
 }
 #[test]
+fn config_rejects_dedupe_file_named_cursors_json() {
+    let path = std::env::temp_dir()
+        .join(format!("ntfy-config-collision-{}", std::process::id()))
+        .join("cursors.json");
+    let env = [
+        ("Forwarder__NtfyUrl", "http://localhost"),
+        ("Forwarder__PushoverUserKey", "user"),
+        ("Forwarder__PushoverDefaultToken", "app"),
+        ("Forwarder__Topics", "[\"alerts\"]"),
+        ("Forwarder__DeduplicationStorePath", path.to_str().unwrap()),
+    ];
+    assert!(
+        Config::load(
+            Path::new("/nonexistent"),
+            env.into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+        )
+        .is_err()
+    );
+}
+#[test]
 fn priority_defaults_and_full_mapping() {
     for (priority, expected) in [
         (None, 0),
@@ -166,6 +187,35 @@ async fn durable_cursors_restore_per_topic_after_restart() {
     assert_eq!(
         forwarder.topics.lock().await["alerts"].cursor.as_deref(),
         Some("ntfy-id-1")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
+async fn cursor_temp_artifacts_do_not_replace_good_file_and_corrupt_file_is_safe() {
+    let dir = std::env::temp_dir().join(format!("ntfy-cursor-atomic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dedupe_path = dir.join("dedupe.json");
+    let cfg = Config {
+        deduplication_store_path: dedupe_path.to_str().unwrap().into(),
+        ..config()
+    };
+    let cursor_path = dir.join("cursors.json");
+    let store = tokio::sync::Mutex::new(Store::default());
+    Store::set_cursor(&store, "alerts", "good-cursor", &cfg).await;
+
+    for torn_temp in [b"".as_slice(), b"{\"alerts\":\"partial".as_slice()] {
+        std::fs::write(dir.join("cursors.json.tmp"), torn_temp).unwrap();
+        let loaded = Store::load(&cfg);
+        assert_eq!(loaded.cursor("alerts"), Some("good-cursor"));
+    }
+
+    std::fs::write(&cursor_path, b"{\"alerts\":").unwrap();
+    let loaded = Store::load(&cfg);
+    assert_eq!(loaded.cursor("alerts"), None);
+    let forwarder = Forwarder::new(cfg).unwrap();
+    assert_eq!(
+        forwarder.topics.lock().await["alerts"].cursor.as_deref(),
+        None
     );
     std::fs::remove_dir_all(dir).unwrap();
 }

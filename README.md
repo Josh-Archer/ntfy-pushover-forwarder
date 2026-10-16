@@ -12,7 +12,7 @@ One Tokio runtime thread handles the subscriptions, HTTP clients, health endpoin
 - An 8 MiB shared logo cache; a 1 MiB limit per incoming JSON line. Image bytes are shared between upload attempts instead of copied.
 - Deduplication uses ntfy message IDs, with shared in-flight reservations across topics and optional file persistence. Successful deliveries are recorded; failures release the reservation.
 - Bounded retries for network errors, HTTP 429 and server errors. Other HTTP 4xx responses are permanent failures and allow processing to continue.
-- Reconnects use exponential backoff with jitter and `since=<last handled ID>`. When `DeduplicationStorePath` is configured, per-topic cursors are saved atomically in `cursors.json` beside the dedupe file and restored after restart. A failed message is retained in memory for retry before resubscribing, including when it is the first message and there is no cursor yet.
+- Reconnects use exponential backoff with jitter and `since=<last handled ID>`. Per-topic cursors are saved in `cursors.json` beside the dedupe file only when `DeduplicationStorePath` is configured, and are restored after restart. The dedupe path cannot be named `cursors.json`. A failed message is retained in memory for retry before resubscribing, including when it is the first message and there is no cursor yet.
 - Optional recovery alerts, `/healthz`, and Prometheus `/metrics` with per-topic counters.
 
 Delivery remains at least once: if Pushover accepts a request but its response is lost, a retry can send a duplicate. Pending messages are retained in memory and are not a durable delivery queue. Cursor persistence requires `DeduplicationStorePath` and stores only the last successfully handled ntfy ID for each topic.
@@ -56,7 +56,7 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 | `MinimumPriority` | `1`; omitted ntfy priorities are treated as `3` |
 | `DeduplicationWindowSeconds` | `300`; zero disables dedupe |
 | `DeduplicationMaxEntries` | `1024`, minimum 1 |
-| `DeduplicationStorePath` | Empty disables dedupe and cursor persistence; cursors use a sibling `cursors.json` file |
+| `DeduplicationStorePath` | Empty disables dedupe and cursor persistence; when set, cursors use a sibling `cursors.json` file (the dedupe file must have a different name) |
 | `SendRecoveryAlerts` | `true` |
 | `HttpPort` | `8080`; zero disables the HTTP listener |
 | `MaxAttachmentBytes` | `2621440`; negative values restore the default |
