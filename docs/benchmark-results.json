@@ -1,0 +1,186 @@
+{
+  "dotnet-memory": {
+    "runs": [
+      {
+        "start_rss_kib": 82484,
+        "idle_rss_kib": 83420,
+        "idle_cpu_seconds": 0.01,
+        "idle_seconds": 3,
+        "load_rss_kib": 94180,
+        "load_cpu_seconds": 0.69,
+        "load_wall_seconds": 2.054,
+        "messages": 1000
+      },
+      {
+        "start_rss_kib": 82664,
+        "idle_rss_kib": 83588,
+        "idle_cpu_seconds": 0.0,
+        "idle_seconds": 3,
+        "load_rss_kib": 94432,
+        "load_cpu_seconds": 0.64,
+        "load_wall_seconds": 1.767,
+        "messages": 1000
+      },
+      {
+        "start_rss_kib": 82436,
+        "idle_rss_kib": 83320,
+        "idle_cpu_seconds": 0.01,
+        "idle_seconds": 3,
+        "load_rss_kib": 94404,
+        "load_cpu_seconds": 0.66,
+        "load_wall_seconds": 1.909,
+        "messages": 1000
+      }
+    ],
+    "median": {
+      "start_rss_kib": 82484,
+      "idle_rss_kib": 83420,
+      "idle_cpu_seconds": 0.01,
+      "idle_seconds": 3,
+      "load_rss_kib": 94404,
+      "load_cpu_seconds": 0.66,
+      "load_wall_seconds": 1.909,
+      "messages": 1000
+    }
+  },
+  "rust-memory": {
+    "runs": [
+      {
+        "start_rss_kib": 6320,
+        "idle_rss_kib": 6320,
+        "idle_cpu_seconds": 0.0,
+        "idle_seconds": 3,
+        "load_rss_kib": 6716,
+        "load_cpu_seconds": 0.04,
+        "load_wall_seconds": 0.987,
+        "messages": 1000
+      },
+      {
+        "start_rss_kib": 6324,
+        "idle_rss_kib": 6324,
+        "idle_cpu_seconds": 0.0,
+        "idle_seconds": 3,
+        "load_rss_kib": 6704,
+        "load_cpu_seconds": 0.04,
+        "load_wall_seconds": 1.002,
+        "messages": 1000
+      },
+      {
+        "start_rss_kib": 6356,
+        "idle_rss_kib": 6356,
+        "idle_cpu_seconds": 0.0,
+        "idle_seconds": 3,
+        "load_rss_kib": 6752,
+        "load_cpu_seconds": 0.04,
+        "load_wall_seconds": 0.99,
+        "messages": 1000
+      }
+    ],
+    "median": {
+      "start_rss_kib": 6324,
+      "idle_rss_kib": 6324,
+      "idle_cpu_seconds": 0.0,
+      "idle_seconds": 3,
+      "load_rss_kib": 6716,
+      "load_cpu_seconds": 0.04,
+      "load_wall_seconds": 0.99,
+      "messages": 1000
+    }
+  },
+  "dotnet-persistent": {
+    "runs": [
+      {
+        "start_rss_kib": 82180,
+        "idle_rss_kib": 83120,
+        "idle_cpu_seconds": 0.01,
+        "idle_seconds": 3,
+        "load_rss_kib": 98244,
+        "load_cpu_seconds": 0.78,
+        "load_wall_seconds": 1.84,
+        "messages": 1000,
+        "persistent": true
+      },
+      {
+        "start_rss_kib": 82324,
+        "idle_rss_kib": 83236,
+        "idle_cpu_seconds": 0.01,
+        "idle_seconds": 3,
+        "load_rss_kib": 99580,
+        "load_cpu_seconds": 0.76,
+        "load_wall_seconds": 1.865,
+        "messages": 1000,
+        "persistent": true
+      },
+      {
+        "start_rss_kib": 82528,
+        "idle_rss_kib": 83452,
+        "idle_cpu_seconds": 0.01,
+        "idle_seconds": 3,
+        "load_rss_kib": 102116,
+        "load_cpu_seconds": 0.81,
+        "load_wall_seconds": 1.911,
+        "messages": 1000,
+        "persistent": true
+      }
+    ],
+    "median": {
+      "start_rss_kib": 82324,
+      "idle_rss_kib": 83236,
+      "idle_cpu_seconds": 0.01,
+      "idle_seconds": 3,
+      "load_rss_kib": 99580,
+      "load_cpu_seconds": 0.78,
+      "load_wall_seconds": 1.865,
+      "messages": 1000,
+      "persistent": true
+    }
+  },
+  "rust-persistent": {
+    "runs": [
+      {
+        "start_rss_kib": 6192,
+        "idle_rss_kib": 6192,
+        "idle_cpu_seconds": 0.0,
+        "idle_seconds": 3,
+        "load_rss_kib": 6740,
+        "load_cpu_seconds": 0.14,
+        "load_wall_seconds": 0.984,
+        "messages": 1000,
+        "persistent": true
+      },
+      {
+        "start_rss_kib": 6204,
+        "idle_rss_kib": 6204,
+        "idle_cpu_seconds": 0.0,
+        "idle_seconds": 3,
+        "load_rss_kib": 6764,
+        "load_cpu_seconds": 0.14,
+        "load_wall_seconds": 1.01,
+        "messages": 1000,
+        "persistent": true
+      },
+      {
+        "start_rss_kib": 6268,
+        "idle_rss_kib": 6268,
+        "idle_cpu_seconds": 0.0,
+        "idle_seconds": 3,
+        "load_rss_kib": 6800,
+        "load_cpu_seconds": 0.15,
+        "load_wall_seconds": 1.002,
+        "messages": 1000,
+        "persistent": true
+      }
+    ],
+    "median": {
+      "start_rss_kib": 6204,
+      "idle_rss_kib": 6204,
+      "idle_cpu_seconds": 0.0,
+      "idle_seconds": 3,
+      "load_rss_kib": 6764,
+      "load_cpu_seconds": 0.14,
+      "load_wall_seconds": 1.002,
+      "messages": 1000,
+      "persistent": true
+    }
+  }
+}

@@ -15,7 +15,7 @@ serviceAccount:
   name: ""
 
 podAnnotations: {}
-# Match non-root $APP_UID from the aspnet image so the dedupe PVC is writable.
+# Keep UID/GID 1654 across runtime migrations so existing dedupe PVCs remain writable.
 podSecurityContext:
   fsGroup: 1654
   seccompProfile:

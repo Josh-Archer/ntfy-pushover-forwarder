@@ -1,18 +1,15 @@
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
-WORKDIR /src
-COPY src/NtfyPushoverForwarder.csproj .
-RUN dotnet restore
-COPY src/ .
-RUN dotnet publish -c Release -o /app/publish /p:UseAppHost=false
+FROM rust:1.98-slim-bookworm AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+RUN cargo build --release --locked
 
-FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
+FROM debian:bookworm-slim AS final
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir /app /data && chown 1654:1654 /app /data
 WORKDIR /app
-COPY --from=build /app/publish .
-
-ENV ASPNETCORE_URLS=http://0.0.0.0:8080
+COPY --from=build /build/target/release/ntfy-pushover-forwarder /usr/local/bin/ntfy-pushover-forwarder
 EXPOSE 8080
-
-# Run as non-root user for security best practices
-USER $APP_UID
-
-ENTRYPOINT ["dotnet", "NtfyPushoverForwarder.dll"]
+USER 1654:1654
+ENTRYPOINT ["/usr/local/bin/ntfy-pushover-forwarder"]
