@@ -1,16 +1,9 @@
-# Build results
-bin/
-obj/
-
-# Visual Studio files
-.vs/
-*.user
-*.userosscache
-*.sln.docstates
-
-# IDEs
+/target/
+.env
 .idea/
 .vscode/
+__pycache__/
 
-# Env
-.env
+# Artifacts left by previous .NET checkouts
+bin/
+obj/

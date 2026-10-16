@@ -1,0 +1,29 @@
+# Exact canary image validated on 2026-10-16; choose a new immutable tag@digest for later runs.
+image:
+  repository: ghcr.io/josh-archer/ntfy-pushover-forwarder
+  tag: canary-66ea3c2b1238111efc512664affe96dadf4379a4@sha256:e3dfb3942eb107daa89f2daeb6d9ab1c43c18f501f21f577630450e4fc29aa92
+fullnameOverride: ntfy-rust-canary
+nodeSelector:
+  kubernetes.io/arch: amd64
+persistence:
+  enabled: true
+  size: 100Mi
+existingSecret: ntfy-secret
+secretKeys:
+  pushoverTopicTokens: {}
+forwarder:
+  topics:
+  - rust-canary-20261016-66ea3c2
+  minimumPriority: 4
+  sendRecoveryAlerts: false
+  deduplicationMaxEntries: 2048
+  deduplicationWindowSeconds: 300
+  soundMap:
+    siren: siren
+  logoMap: {}
+resources:
+  requests:
+    cpu: 5m
+    memory: 16Mi
+  limits:
+    memory: 64Mi

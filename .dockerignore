@@ -1,0 +1,9 @@
+.git
+.github
+target
+bin
+obj
+tests
+scripts
+docs
+.env
