@@ -3,6 +3,7 @@ namespace NtfyPushoverForwarder;
 public sealed class InMemoryDedupeStore : IDedupeStore
 {
     private readonly Dictionary<string, DateTimeOffset> _entries = new();
+    private readonly HashSet<string> _inFlight = new();
     private readonly object _lock = new();
 
     public int Count
@@ -47,6 +48,55 @@ public sealed class InMemoryDedupeStore : IDedupeStore
             _entries[fingerprint] = now;
             PruneToMax(maxEntries);
             return false;
+        }
+    }
+
+    public DedupeAttemptResult TryBegin(string fingerprint, DateTimeOffset now, TimeSpan window)
+    {
+        if (window <= TimeSpan.Zero)
+        {
+            return DedupeAttemptResult.Acquired;
+        }
+
+        var cutoff = now - window;
+        lock (_lock)
+        {
+            if (_entries.TryGetValue(fingerprint, out var seen) && seen >= cutoff)
+            {
+                return DedupeAttemptResult.Duplicate;
+            }
+
+            if (!_inFlight.Add(fingerprint))
+            {
+                return DedupeAttemptResult.InProgress;
+            }
+
+            return DedupeAttemptResult.Acquired;
+        }
+    }
+
+    public void Complete(string fingerprint, bool succeeded, DateTimeOffset now, TimeSpan window, int maxEntries)
+    {
+        lock (_lock)
+        {
+            if (!_inFlight.Remove(fingerprint))
+            {
+                return;
+            }
+
+            if (!succeeded || window <= TimeSpan.Zero)
+            {
+                return;
+            }
+
+            var cutoff = now - window;
+            foreach (var stale in _entries.Where(e => e.Value < cutoff).Select(e => e.Key).ToArray())
+            {
+                _entries.Remove(stale);
+            }
+
+            _entries[fingerprint] = now;
+            PruneToMax(maxEntries);
         }
     }
 

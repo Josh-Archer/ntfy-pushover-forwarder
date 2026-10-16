@@ -27,6 +27,28 @@ public class CursorAdvanceTests
         }
     }
 
+    private sealed class BlockingPushoverHandler : HttpMessageHandler
+    {
+        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _calls;
+
+        public int Calls => _calls;
+        public Task Entered => _entered.Task;
+        public void Release() => _release.TrySetResult();
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _calls);
+            _entered.TrySetResult();
+            await _release.Task.WaitAsync(cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"status\":1}")
+            };
+        }
+    }
+
     private class TestHttpClientFactory : IHttpClientFactory
     {
         private readonly HttpMessageHandler _handler;
@@ -123,6 +145,30 @@ public class CursorAdvanceTests
         var (worker, connections) = Create(BaseOptions(), HttpStatusCode.OK);
         await worker.HandleMessageAsync("alerts", Msg("msg-ok", 1002), CancellationToken.None);
         Assert.Equal("msg-ok", connections.GetSinceCursor("alerts"));
+    }
+
+    [Fact]
+    public async Task ForwardToPushoverAsync_ConcurrentDuplicate_IsSentOnlyOnce()
+    {
+        var handler = new BlockingPushoverHandler();
+        var worker = new Worker(
+            NullLogger<Worker>.Instance,
+            new TestHttpClientFactory(handler),
+            Options.Create(BaseOptions()),
+            new ForwarderMetrics(new TestMeterFactory()),
+            new TopicConnectionTracker(),
+            new InMemoryDedupeStore());
+
+        var first = worker.ForwardToPushoverAsync("alerts", Msg("same-id", 1001), CancellationToken.None);
+        await handler.Entered;
+        var second = await worker.ForwardToPushoverAsync("alerts", Msg("same-id", 1001), CancellationToken.None);
+
+        handler.Release();
+        var firstResult = await first;
+
+        Assert.Equal(ForwardResult.TransientFailure, second);
+        Assert.Equal(ForwardResult.Success, firstResult);
+        Assert.Equal(1, handler.Calls);
     }
 
     [Fact]

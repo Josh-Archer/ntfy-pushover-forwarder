@@ -35,6 +35,18 @@ public sealed class FileDedupeStore : IDedupeStore
         return isDuplicate;
     }
 
+    public DedupeAttemptResult TryBegin(string fingerprint, DateTimeOffset now, TimeSpan window)
+        => _memory.TryBegin(fingerprint, now, window);
+
+    public void Complete(string fingerprint, bool succeeded, DateTimeOffset now, TimeSpan window, int maxEntries)
+    {
+        _memory.Complete(fingerprint, succeeded, now, window, maxEntries);
+        if (succeeded)
+        {
+            Persist();
+        }
+    }
+
     private void Load(TimeSpan window, int maxEntries)
     {
         try
