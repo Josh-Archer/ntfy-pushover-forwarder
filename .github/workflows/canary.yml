@@ -1,8 +1,6 @@
 name: Rust canary image
 
 on:
-  push:
-    branches: ['feat/rust-*']
   workflow_dispatch:
 
 permissions:
