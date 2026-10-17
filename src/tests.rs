@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     config::Config,
     dedupe::{Claim, Store},
-    message::Message,
+    message::{Action, Message, truncate_chars},
 };
 use chrono::{Duration, Utc};
 use std::path::Path;
@@ -119,6 +119,264 @@ fn fingerprint_preserves_dotnet_format() {
         first,
         "hash:FBAC77D690B87F12F0A2D094528EC91DC66F42A1F651E6B2EB64AA9C70CEBD14"
     );
+}
+#[test]
+fn action_and_url_mapping_precedence_and_fallbacks() {
+    let json = r#"{
+        "id": "1",
+        "actions": [
+            {"id": "act1", "action": "broadcast", "label": "No URL"},
+            {"id": "act2", "action": "view", "label": " Open Web ", "url": " https://example.com/web ", "clear": true, "extra": "ignored"}
+        ],
+        "click": "https://example.com/click"
+    }"#;
+    let msg: Message = serde_json::from_str(json).unwrap();
+    assert_eq!(msg.actions().len(), 2);
+    assert_eq!(msg.actions()[0].target_url(), None);
+    assert_eq!(msg.actions()[0].button_label(), Some("No URL"));
+    assert_eq!(
+        msg.actions()[1].target_url(),
+        Some("https://example.com/web")
+    );
+    assert_eq!(msg.actions()[1].button_label(), Some("Open Web"));
+    assert_eq!(msg.actions()[1].clear, Some(true));
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/web", Some("Open Web")))
+    );
+
+    let explicit_action = Action {
+        id: Some("id1".into()),
+        action: Some("view".into()),
+        label: Some("Label".into()),
+        url: Some("https://example.com/custom".into()),
+        clear: Some(true),
+    };
+    assert_eq!(
+        explicit_action.target_url(),
+        Some("https://example.com/custom")
+    );
+    assert_eq!(explicit_action.button_label(), Some("Label"));
+
+    let msg: Message =
+        serde_json::from_str(r#"{"actions":[{"action":"view","url":"https://example.com"}]}"#)
+            .unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com", None)));
+
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"view","url":"https://example.com","label":"   "}]}"#,
+    )
+    .unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com", None)));
+
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"view","url":"   ","label":"btn"}],"click":"https://example.com/click"}"#,
+    )
+    .unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com/click", None)));
+
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"broadcast"}],"click":" https://example.com/c "}"#,
+    )
+    .unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com/c", None)));
+
+    let msg: Message = serde_json::from_str(r#"{"click":"   "}"#).unwrap();
+    assert_eq!(msg.url(), None);
+
+    let msg = Message::default();
+    assert_eq!(msg.url(), None);
+}
+
+#[test]
+fn action_url_only_takes_view_or_http_ignoring_broadcast_and_others() {
+    // Missing action type with URL is ignored
+    let msg: Message =
+        serde_json::from_str(r#"{"actions":[{"url":"https://example.com"}]}"#).unwrap();
+    assert_eq!(msg.url(), None);
+
+    // Broadcast action with URL is ignored
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"broadcast","url":"https://example.com/broadcast","label":"Broadcast"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(msg.url(), None);
+
+    // Unknown action type with URL is ignored
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"custom_action","url":"https://example.com/custom","label":"Custom"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(msg.url(), None);
+
+    // Broadcast with URL does not prevent fallback to click
+    let msg: Message = serde_json::from_str(
+        r#"{
+            "actions":[{"action":"broadcast","url":"https://example.com/broadcast","label":"Broadcast"}],
+            "click":"https://example.com/click"
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com/click", None)));
+
+    // Http action is supported
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"http","url":"https://example.com/api","label":"Trigger API"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/api", Some("Trigger API")))
+    );
+
+    // Case-insensitive action type matching (e.g. VIEW, HTTP)
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"VIEW","url":"https://example.com/upper","label":"Upper"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/upper", Some("Upper")))
+    );
+
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"Http","url":"https://example.com/mixed","label":"Mixed"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/mixed", Some("Mixed")))
+    );
+}
+
+#[test]
+fn multiple_actions_selection_and_ordering() {
+    // Broadcast action with a URL appearing before a later view action does not win; view action is selected
+    let json = r#"{
+        "actions": [
+            {"action": "broadcast", "label": "Android Broadcast", "url": "https://example.com/broadcast"},
+            {"action": "view", "label": "Open Dashboard", "url": "https://example.com/dashboard"}
+        ]
+    }"#;
+    let msg: Message = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/dashboard", Some("Open Dashboard")))
+    );
+
+    // Broadcast action with a URL appearing before a later http action does not win; http action is selected
+    let json = r#"{
+        "actions": [
+            {"action": "broadcast", "label": "Android Broadcast", "url": "https://example.com/broadcast"},
+            {"action": "http", "label": "Ack Alert", "url": "https://example.com/ack"}
+        ]
+    }"#;
+    let msg: Message = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/ack", Some("Ack Alert")))
+    );
+
+    // First view action lacks URL, followed by broadcast with URL, followed by view action with URL
+    let json = r#"{
+        "actions": [
+            {"action": "view", "label": "No URL Here"},
+            {"action": "broadcast", "label": "Broadcast", "url": "https://example.com/broadcast"},
+            {"action": "view", "label": "Second View", "url": "https://example.com/second"}
+        ]
+    }"#;
+    let msg: Message = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/second", Some("Second View")))
+    );
+
+    // Multiple valid actions select the first matching view/http action
+    let json = r#"{
+        "actions": [
+            {"action": "view", "label": "First View", "url": "https://example.com/first"},
+            {"action": "http", "label": "Second Action", "url": "https://example.com/second"}
+        ]
+    }"#;
+    let msg: Message = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/first", Some("First View")))
+    );
+}
+
+#[test]
+fn action_url_and_title_truncation_and_char_boundary_safety() {
+    // Standalone helper unit tests
+    assert_eq!(truncate_chars("", 512), "");
+    assert_eq!(truncate_chars("short", 512), "short");
+    let exact_100 = "a".repeat(100);
+    assert_eq!(truncate_chars(&exact_100, 100), exact_100);
+    let exact_512 = "a".repeat(512);
+    assert_eq!(truncate_chars(&exact_512, 512), exact_512);
+
+    let overlong_620 = "u".repeat(620);
+    let truncated_512 = truncate_chars(&overlong_620, 512);
+    assert_eq!(truncated_512.chars().count(), 512);
+    assert_eq!(truncated_512, &overlong_620[..512]);
+
+    let overlong_150 = "t".repeat(150);
+    let truncated_100 = truncate_chars(&overlong_150, 100);
+    assert_eq!(truncated_100.chars().count(), 100);
+    assert_eq!(truncated_100, &overlong_150[..100]);
+
+    // Char-boundary safety with 4-byte UTF-8 emoji at boundaries
+    // 511 ASCII chars + 4-byte emoji (🦀) + trailing characters -> 512 chars exactly
+    let multi_url = format!("{}🦀extra", "x".repeat(511));
+    let truncated_url = truncate_chars(&multi_url, 512);
+    assert_eq!(truncated_url.chars().count(), 512);
+    assert!(truncated_url.ends_with('🦀'));
+    assert_eq!(truncated_url.len(), 511 + 4);
+
+    // 99 ASCII chars + 4-byte emoji (🚀) + trailing characters -> 100 chars exactly
+    let multi_title = format!("{}🚀extra", "y".repeat(99));
+    let truncated_title = truncate_chars(&multi_title, 100);
+    assert_eq!(truncated_title.chars().count(), 100);
+    assert!(truncated_title.ends_with('🚀'));
+    assert_eq!(truncated_title.len(), 99 + 4);
+
+    // 120 3-byte Japanese hiragana characters truncated to 100 chars
+    let japanese = "あ".repeat(120);
+    let truncated_jp = truncate_chars(&japanese, 100);
+    assert_eq!(truncated_jp.chars().count(), 100);
+    assert_eq!(truncated_jp, "あ".repeat(100));
+    assert_eq!(truncated_jp.len(), 300);
+
+    // Message::url() truncation on action url and label
+    let json = format!(
+        r#"{{"actions":[{{"action":"view","label":"{}","url":"https://example.com/{}"}}]}}"#,
+        "L".repeat(150),
+        "a".repeat(600)
+    );
+    let msg: Message = serde_json::from_str(&json).unwrap();
+    let (url, title) = msg.url().unwrap();
+    assert_eq!(url.chars().count(), 512);
+    assert_eq!(
+        url,
+        &format!("https://example.com/{}", "a".repeat(600))[..512]
+    );
+    assert_eq!(title.unwrap().chars().count(), 100);
+    assert_eq!(title.unwrap(), "L".repeat(100));
+
+    // Message::url() truncation on fallback click URL
+    let click_url = format!("https://example.com/click/{}", "c".repeat(600));
+    let msg: Message = serde_json::from_str(&format!(r#"{{"click":"{click_url}"}}"#)).unwrap();
+    let (url, title) = msg.url().unwrap();
+    assert_eq!(url.chars().count(), 512);
+    assert_eq!(url, &click_url[..512]);
+    assert_eq!(title, None);
+
+    // Message::url() char-boundary safe truncation with multi-byte emoji on fallback click
+    let multi_click = format!("https://example.com/{}🦀extra", "c".repeat(511 - 20));
+    let msg: Message = serde_json::from_str(&format!(r#"{{"click":"{multi_click}"}}"#)).unwrap();
+    let (url, _) = msg.url().unwrap();
+    assert_eq!(url.chars().count(), 512);
+    assert!(url.ends_with('🦀'));
 }
 #[tokio::test]
 async fn dedupe_reservations_release_on_failure_and_expire() {
