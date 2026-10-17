@@ -7,7 +7,7 @@ One Tokio runtime thread handles the subscriptions, HTTP clients, health endpoin
 ## Behavior
 
 - Topic-to-app token routing, tag-to-sound mapping and `device:phone` targeting.
-- Action buttons (`actions`) and `click` URLs map to Pushover `url` and `url_title` button fields.
+- Action buttons (`actions`) of type `view` or `http` and `click` URLs map to Pushover `url` (truncated to 512 characters) and `url_title` (truncated to 100 characters) button fields.
 - ntfy priority 1–5 maps to Pushover −2 through 2. Missing priority means 3. Emergency messages set retry=60 and expire=3600.
 - Inline images and tag-based fallback logos. Downloads are limited to 2.5 MiB by default, including chunked responses. Only images are attached; a failed download still allows the text alert through.
 - An 8 MiB shared logo cache; a 1 MiB limit per incoming JSON line. Image bytes are shared between upload attempts instead of copied.
@@ -65,7 +65,7 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 | `RetryDelayMilliseconds` | `0` |
 | `ReconnectInitialDelayMilliseconds` | `1000`; capped at 60 seconds plus up to 20% jitter |
 
-`html` tags preserve markup. `markdown` or `md` tags HTML-escape the body and convert backtick spans to `<code>`. Formatting tags are case insensitive. Action buttons (`actions`) and `click` URLs map to Pushover `url` and `url_title` button fields, preferring the first action with a URL. Images without an attachment use the first matching `LogoMap` tag, with `mag` as a fallback for topics containing `media`.
+`html` tags preserve markup. `markdown` or `md` tags HTML-escape the body and convert backtick spans to `<code>`. Formatting tags are case insensitive. Action buttons (`actions`) and `click` URLs map to Pushover `url` and `url_title` button fields, preferring the first `view` or `http` action with a URL (non-`view`/`http` actions such as `broadcast` are ignored). URLs are truncated to Pushover's 512-character limit, and button labels (`url_title`) are truncated to 100 characters. Images without an attachment use the first matching `LogoMap` tag, with `mag` as a fallback for topics containing `media`.
 
 The ntfy token is sent only to same-origin message attachments, never to logos or other origins. HTTP redirects are disabled for subscriptions, API posts and image downloads; configure final URLs directly.
 

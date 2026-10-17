@@ -283,7 +283,26 @@ class Compatibility(unittest.TestCase):
         # 4. Action without url falls back to click
         self.api.send(id='action-4', message='msg4', click='https://example.com/fallback',
                       actions=[{'action': 'broadcast', 'label': 'Broadcast Only'}])
-        posts = self.posts(4)
+        # 5. Overlong url (620 chars) and overlong label (150 chars) truncated to 512 and 100
+        long_url = 'https://example.com/' + 'u' * 600
+        long_title = 'Button ' + 't' * 143
+        self.api.send(id='action-5', message='msg5',
+                      actions=[{'action': 'view', 'label': long_title, 'url': long_url}])
+        # 6. Broadcast action carrying a url appears before a view action: view action wins
+        self.api.send(id='action-6', message='msg6',
+                      actions=[{'action': 'broadcast', 'label': 'Broadcast With URL', 'url': 'https://example.com/broadcast'},
+                               {'action': 'view', 'label': 'View Wins', 'url': 'https://example.com/view-wins'}])
+        # 7. Http action maps to url and url_title
+        self.api.send(id='action-7', message='msg7',
+                      actions=[{'action': 'http', 'label': 'Webhook', 'url': 'https://example.com/webhook'}])
+        # 8. Broadcast action carrying a url falls back to click
+        self.api.send(id='action-8', message='msg8', click='https://example.com/click-fallback',
+                      actions=[{'action': 'broadcast', 'label': 'Broadcast With URL', 'url': 'https://example.com/broadcast-ignored'}])
+        # 9. Overlong click url (600 chars) truncated to 512
+        click_long = 'https://example.com/click/' + 'c' * 600
+        self.api.send(id='action-9', message='msg9', click=click_long)
+
+        posts = self.posts(9)
         self.assertEqual(posts[0]['url'], 'https://example.com/site')
         self.assertEqual(posts[0]['url_title'], 'Open Site')
         self.assertEqual(posts[1]['url'], 'https://example.com/nolabel')
@@ -292,6 +311,19 @@ class Compatibility(unittest.TestCase):
         self.assertEqual(posts[2]['url_title'], 'Action Preferred')
         self.assertEqual(posts[3]['url'], 'https://example.com/fallback')
         self.assertNotIn('url_title', posts[3])
+        self.assertEqual(posts[4]['url'], long_url[:512])
+        self.assertEqual(len(posts[4]['url']), 512)
+        self.assertEqual(posts[4]['url_title'], long_title[:100])
+        self.assertEqual(len(posts[4]['url_title']), 100)
+        self.assertEqual(posts[5]['url'], 'https://example.com/view-wins')
+        self.assertEqual(posts[5]['url_title'], 'View Wins')
+        self.assertEqual(posts[6]['url'], 'https://example.com/webhook')
+        self.assertEqual(posts[6]['url_title'], 'Webhook')
+        self.assertEqual(posts[7]['url'], 'https://example.com/click-fallback')
+        self.assertNotIn('url_title', posts[7])
+        self.assertEqual(posts[8]['url'], click_long[:512])
+        self.assertEqual(len(posts[8]['url']), 512)
+        self.assertNotIn('url_title', posts[8])
 
     def test_transient_failure_retries_first_message_then_replays_in_order(self):
         self.start()

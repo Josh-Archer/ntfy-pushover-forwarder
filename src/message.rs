@@ -11,7 +11,20 @@ pub struct Action {
     pub clear: Option<bool>,
 }
 
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    s.char_indices()
+        .nth(max_chars)
+        .map_or(s, |(idx, _)| &s[..idx])
+}
+
 impl Action {
+    pub fn is_view_or_http(&self) -> bool {
+        self.action
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|a| a.eq_ignore_ascii_case("view") || a.eq_ignore_ascii_case("http"))
+    }
+
     pub fn target_url(&self) -> Option<&str> {
         self.url.as_deref().map(str::trim).filter(|u| !u.is_empty())
     }
@@ -70,15 +83,21 @@ impl Message {
     }
     pub fn url(&self) -> Option<(&str, Option<&str>)> {
         for action in self.actions() {
+            if !action.is_view_or_http() {
+                continue;
+            }
             if let Some(url) = action.target_url() {
-                return Some((url, action.button_label()));
+                return Some((
+                    truncate_chars(url, 512),
+                    action.button_label().map(|l| truncate_chars(l, 100)),
+                ));
             }
         }
         self.click
             .as_deref()
             .map(str::trim)
             .filter(|c| !c.is_empty())
-            .map(|click| (click, None))
+            .map(|click| (truncate_chars(click, 512), None))
     }
     pub fn fingerprint(&self, topic: &str) -> String {
         if !self.id.trim().is_empty() {
