@@ -13,7 +13,7 @@ One Tokio runtime thread handles the subscriptions, HTTP clients, health endpoin
 - An 8 MiB shared logo cache; a 1 MiB limit per incoming JSON line. Image bytes are shared between upload attempts instead of copied.
 - Deduplication uses ntfy message IDs, with shared in-flight reservations across topics and optional file persistence. Successful deliveries are recorded; failures release the reservation.
 - Bounded retries for network errors, HTTP 429 and server errors. Other HTTP 4xx responses are permanent failures and allow processing to continue.
-- Reconnects use exponential backoff with jitter and `since=<last handled ID>`. Per-topic cursors are saved in `cursors.json` beside the dedupe file only when `DeduplicationStorePath` is configured, and are restored after restart. The dedupe path cannot be named `cursors.json`. A failed message is retained in memory for retry before resubscribing, including when it is the first message and there is no cursor yet.
+- Reconnects use exponential backoff with jitter and `since=<last handled ID>`. A topic with no saved cursor (first start, or after its cursor is lost) requests `since=<InitialSince>` (default `10m`, empty for live-only). Per-topic cursors are saved in `cursors.json` beside the dedupe file only when `DeduplicationStorePath` is configured, and are restored after restart. The dedupe path cannot be named `cursors.json`. A failed message is retained in memory for retry before resubscribing, including when it is the first message and there is no cursor yet.
 - Optional recovery alerts, `/healthz`, and Prometheus `/metrics` with per-topic counters.
 
 Delivery remains at least once: if Pushover accepts a request but its response is lost, a retry can send a duplicate. Pending messages are retained in memory and are not a durable delivery queue. Cursor persistence requires `DeduplicationStorePath` and stores only the last successfully handled ntfy ID for each topic.
@@ -58,6 +58,7 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 | `DeduplicationWindowSeconds` | `300`; zero disables dedupe |
 | `DeduplicationMaxEntries` | `1024`, minimum 1 |
 | `DeduplicationStorePath` | Empty disables dedupe and cursor persistence; when set, cursors use a sibling `cursors.json` file (the dedupe file must have a different name) |
+| `InitialSince` | ntfy `since` used for a topic with no saved cursor (default `10m`; empty streams live-only) |
 | `SendRecoveryAlerts` | `true` |
 | `HttpPort` | `8080`; zero disables the HTTP listener |
 | `MaxAttachmentBytes` | `2621440`; negative values restore the default |

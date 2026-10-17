@@ -138,6 +138,19 @@ impl Forwarder {
             attempt = attempt.saturating_add(1);
         }
     }
+    pub(crate) fn stream_url(&self, topic: &str, cursor: Option<&str>) -> Result<Url> {
+        let mut url = Url::parse(&format!(
+            "{}/{}/json",
+            self.config.ntfy_url.trim_end_matches('/'),
+            topic
+        ))?;
+        // Resume from the saved cursor; without one, replay only the configured initial window.
+        let since = cursor.or(Some(self.config.initial_since.as_str()).filter(|s| !s.is_empty()));
+        if let Some(since) = since {
+            url.query_pairs_mut().append_pair("since", since);
+        }
+        Ok(url)
+    }
     async fn consume(
         &self,
         topic: &str,
@@ -146,14 +159,7 @@ impl Forwarder {
         attempt: &mut u32,
         pending: &mut Option<Message>,
     ) -> Result<()> {
-        let mut url = Url::parse(&format!(
-            "{}/{}/json",
-            self.config.ntfy_url.trim_end_matches('/'),
-            topic
-        ))?;
-        if let Some(cursor) = cursor {
-            url.query_pairs_mut().append_pair("since", cursor);
-        }
+        let url = self.stream_url(topic, cursor)?;
         let mut request = self.stream_client.get(url);
         if !self.config.ntfy_token.is_empty() {
             request = request.bearer_auth(&self.config.ntfy_token);

@@ -16,6 +16,8 @@ pub struct Config {
     pub deduplication_max_entries: usize,
     pub deduplication_store_path: String,
     pub send_recovery_alerts: bool,
+    /// ntfy `since` value used for a topic with no saved cursor (empty = live only).
+    pub initial_since: String,
     pub http_port: u16,
     pub topics: Vec<String>,
     pub topic_tokens: HashMap<String, String>,
@@ -39,6 +41,7 @@ impl Default for Config {
             deduplication_max_entries: 1024,
             deduplication_store_path: String::new(),
             send_recovery_alerts: true,
+            initial_since: "10m".into(),
             http_port: 8080,
             topics: vec![],
             topic_tokens: HashMap::new(),

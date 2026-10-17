@@ -501,3 +501,24 @@ async fn health_and_metrics_report_per_topic_state() {
             .contains("ntfy_forwarder_messages_received_total{topic=\"a\"} 0")
     );
 }
+
+#[test]
+fn stream_url_resumes_from_cursor_or_initial_window() {
+    let forwarder = Forwarder::new(config()).unwrap();
+    let url = forwarder.stream_url("alerts", None).unwrap();
+    assert_eq!(url.as_str(), "http://localhost:9999/alerts/json?since=10m");
+    let url = forwarder.stream_url("alerts", Some("ntfy-id-1")).unwrap();
+    assert_eq!(
+        url.as_str(),
+        "http://localhost:9999/alerts/json?since=ntfy-id-1"
+    );
+    let live = Forwarder::new(Config {
+        initial_since: String::new(),
+        ..config()
+    })
+    .unwrap();
+    assert_eq!(
+        live.stream_url("alerts", None).unwrap().as_str(),
+        "http://localhost:9999/alerts/json"
+    );
+}
