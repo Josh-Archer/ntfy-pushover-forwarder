@@ -1,7 +1,30 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Action {
+    pub id: Option<String>,
+    pub action: Option<String>,
+    pub label: Option<String>,
+    pub url: Option<String>,
+    pub clear: Option<bool>,
+}
+
+impl Action {
+    pub fn target_url(&self) -> Option<&str> {
+        self.url.as_deref().map(str::trim).filter(|u| !u.is_empty())
+    }
+
+    pub fn button_label(&self) -> Option<&str> {
+        self.label
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Message {
     pub id: String,
@@ -11,9 +34,11 @@ pub struct Message {
     pub priority: Option<i32>,
     pub tags: Option<Vec<String>>,
     pub click: Option<String>,
+    pub actions: Option<Vec<Action>>,
     pub attachment: Option<Attachment>,
 }
-#[derive(Default, Deserialize)]
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Attachment {
     pub url: Option<String>,
@@ -37,8 +62,23 @@ impl Message {
     pub fn tags(&self) -> &[String] {
         self.tags.as_deref().unwrap_or_default()
     }
+    pub fn actions(&self) -> &[Action] {
+        self.actions.as_deref().unwrap_or_default()
+    }
     pub fn priority(&self) -> i32 {
         self.priority.unwrap_or(3).saturating_sub(3).clamp(-2, 2)
+    }
+    pub fn url(&self) -> Option<(&str, Option<&str>)> {
+        for action in self.actions() {
+            if let Some(url) = action.target_url() {
+                return Some((url, action.button_label()));
+            }
+        }
+        self.click
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(|click| (click, None))
     }
     pub fn fingerprint(&self, topic: &str) -> String {
         if !self.id.trim().is_empty() {

@@ -269,6 +269,30 @@ class Compatibility(unittest.TestCase):
         wait_for(lambda: 'ntfy_forwarder_messages_dropped_dedupe_total{topic="alerts"} 1' in self.worker.get_metrics())
         self.assertEqual(len(self.api.posts), 2)
 
+    def test_actions_forward_as_pushover_url_and_url_title(self):
+        self.start()
+        # 1. Action with url and label maps to url and url_title
+        self.api.send(id='action-1', message='msg1',
+                      actions=[{'action': 'view', 'label': 'Open Site', 'url': 'https://example.com/site'}])
+        # 2. Action with url and no label maps to url without url_title
+        self.api.send(id='action-2', message='msg2',
+                      actions=[{'action': 'view', 'url': 'https://example.com/nolabel'}])
+        # 3. Action overrides click
+        self.api.send(id='action-3', message='msg3', click='https://example.com/click',
+                      actions=[{'action': 'view', 'label': 'Action Preferred', 'url': 'https://example.com/action'}])
+        # 4. Action without url falls back to click
+        self.api.send(id='action-4', message='msg4', click='https://example.com/fallback',
+                      actions=[{'action': 'broadcast', 'label': 'Broadcast Only'}])
+        posts = self.posts(4)
+        self.assertEqual(posts[0]['url'], 'https://example.com/site')
+        self.assertEqual(posts[0]['url_title'], 'Open Site')
+        self.assertEqual(posts[1]['url'], 'https://example.com/nolabel')
+        self.assertNotIn('url_title', posts[1])
+        self.assertEqual(posts[2]['url'], 'https://example.com/action')
+        self.assertEqual(posts[2]['url_title'], 'Action Preferred')
+        self.assertEqual(posts[3]['url'], 'https://example.com/fallback')
+        self.assertNotIn('url_title', posts[3])
+
     def test_transient_failure_retries_first_message_then_replays_in_order(self):
         self.start()
         self.api.responses = [500, 429, 200, 200]

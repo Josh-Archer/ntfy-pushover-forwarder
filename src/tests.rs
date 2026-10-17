@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     config::Config,
     dedupe::{Claim, Store},
-    message::Message,
+    message::{Action, Message},
 };
 use chrono::{Duration, Utc};
 use std::path::Path;
@@ -119,6 +119,71 @@ fn fingerprint_preserves_dotnet_format() {
         first,
         "hash:FBAC77D690B87F12F0A2D094528EC91DC66F42A1F651E6B2EB64AA9C70CEBD14"
     );
+}
+#[test]
+fn action_and_url_mapping_precedence_and_fallbacks() {
+    let json = r#"{
+        "id": "1",
+        "actions": [
+            {"id": "act1", "action": "broadcast", "label": "No URL"},
+            {"id": "act2", "action": "view", "label": " Open Web ", "url": " https://example.com/web ", "clear": true, "extra": "ignored"}
+        ],
+        "click": "https://example.com/click"
+    }"#;
+    let msg: Message = serde_json::from_str(json).unwrap();
+    assert_eq!(msg.actions().len(), 2);
+    assert_eq!(msg.actions()[0].target_url(), None);
+    assert_eq!(msg.actions()[0].button_label(), Some("No URL"));
+    assert_eq!(
+        msg.actions()[1].target_url(),
+        Some("https://example.com/web")
+    );
+    assert_eq!(msg.actions()[1].button_label(), Some("Open Web"));
+    assert_eq!(msg.actions()[1].clear, Some(true));
+    assert_eq!(
+        msg.url(),
+        Some(("https://example.com/web", Some("Open Web")))
+    );
+
+    let explicit_action = Action {
+        id: Some("id1".into()),
+        action: Some("view".into()),
+        label: Some("Label".into()),
+        url: Some("https://example.com/custom".into()),
+        clear: Some(true),
+    };
+    assert_eq!(
+        explicit_action.target_url(),
+        Some("https://example.com/custom")
+    );
+    assert_eq!(explicit_action.button_label(), Some("Label"));
+
+    let msg: Message =
+        serde_json::from_str(r#"{"actions":[{"url":"https://example.com"}]}"#).unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com", None)));
+
+    let msg: Message =
+        serde_json::from_str(r#"{"actions":[{"url":"https://example.com","label":"   "}]}"#)
+            .unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com", None)));
+
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"url":"   ","label":"btn"}],"click":"https://example.com/click"}"#,
+    )
+    .unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com/click", None)));
+
+    let msg: Message = serde_json::from_str(
+        r#"{"actions":[{"action":"broadcast"}],"click":" https://example.com/c "}"#,
+    )
+    .unwrap();
+    assert_eq!(msg.url(), Some(("https://example.com/c", None)));
+
+    let msg: Message = serde_json::from_str(r#"{"click":"   "}"#).unwrap();
+    assert_eq!(msg.url(), None);
+
+    let msg = Message::default();
+    assert_eq!(msg.url(), None);
 }
 #[tokio::test]
 async fn dedupe_reservations_release_on_failure_and_expire() {

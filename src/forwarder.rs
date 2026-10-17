@@ -281,8 +281,11 @@ impl Forwarder {
         {
             form = form.text("device", device.to_owned());
         }
-        if let Some(click) = message.click.as_ref().filter(|s| !s.is_empty()) {
-            form = form.text("url", click.clone());
+        if let Some((url, url_title)) = message.url() {
+            form = form.text("url", url.to_owned());
+            if let Some(title) = url_title {
+                form = form.text("url_title", title.to_owned());
+            }
         }
         if message.priority() == 2 {
             form = form.text("retry", "60").text("expire", "3600");
