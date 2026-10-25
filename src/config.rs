@@ -15,6 +15,8 @@ pub struct Config {
     pub deduplication_window_seconds: i64,
     pub deduplication_max_entries: usize,
     pub deduplication_store_path: String,
+    pub queue_store_path: String,
+    pub queue_max_bytes: usize,
     pub send_recovery_alerts: bool,
     /// ntfy `since` value used for a topic with no saved cursor (empty = live only).
     pub initial_since: String,
@@ -40,6 +42,8 @@ impl Default for Config {
             deduplication_window_seconds: 300,
             deduplication_max_entries: 1024,
             deduplication_store_path: String::new(),
+            queue_store_path: String::new(),
+            queue_max_bytes: 64 * 1024 * 1024,
             send_recovery_alerts: true,
             initial_since: "10m".into(),
             http_port: 8080,

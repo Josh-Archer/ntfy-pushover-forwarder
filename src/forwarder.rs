@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     dedupe::{Claim, Store},
     message::Message,
+    queue::Queue,
 };
 use anyhow::{Result, bail};
 use bytes::Bytes;
@@ -51,6 +52,7 @@ pub struct Forwarder {
     pub config: Config,
     pub topics: Mutex<HashMap<String, TopicState>>,
     store: Mutex<Store>,
+    queue: Mutex<Queue>,
     icons: Mutex<HashMap<String, Image>>,
     stream_client: Client,
     post_client: Client,
@@ -71,12 +73,23 @@ impl Forwarder {
                 .redirect(reqwest::redirect::Policy::none())
         };
         let store = Store::load(&config);
+        let queue = Queue::open(&config)?;
         let topics = config
             .topics
             .iter()
             .map(|t| {
                 let state = TopicState {
-                    cursor: store.cursor(t).map(str::to_owned),
+                    cursor: queue
+                        .cursor(t)
+                        .or_else(|| store.cursor(t))
+                        .map(str::to_owned),
+                    pending_since: queue.pending(t).map(|e| {
+                        let now = std::time::Instant::now();
+                        now.checked_sub(Duration::from_secs(
+                            Utc::now().timestamp().saturating_sub(e.accepted_at).max(0) as u64,
+                        ))
+                        .unwrap_or(now)
+                    }),
                     ..TopicState::default()
                 };
                 (t.clone(), state)
@@ -84,6 +97,7 @@ impl Forwarder {
             .collect();
         Ok(Arc::new(Self {
             store: Mutex::new(store),
+            queue: Mutex::new(queue),
             config,
             topics: Mutex::new(topics),
             icons: Mutex::new(HashMap::new()),
@@ -100,7 +114,7 @@ impl Forwarder {
         let mut outage = false;
         // A failed first message has no preceding cursor. Retain it for retry instead of
         // reconnecting live and silently losing it if ntfy doesn't replay without since=.
-        let mut pending: Option<Message> = None;
+        let mut pending = self.queue.lock().await.pending(&topic).map(|e| e.message);
         loop {
             if let Some(message) = pending.as_ref() {
                 match self.deliver(&topic, message).await {
@@ -114,8 +128,19 @@ impl Forwarder {
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
-                    Delivery::Success => self.advance_cursor(&topic, &message.id).await,
-                    Delivery::Permanent => {}
+                    Delivery::Success => {
+                        if self.acknowledge(&topic, &message.id).await.is_err() {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                    Delivery::Permanent => {
+                        if self.queue.lock().await.reject(&topic, &message.id).is_err() {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        self.advance_cursor(&topic, &message.id).await;
+                    }
                 }
                 pending = None;
             }
@@ -202,9 +227,18 @@ impl Forwarder {
             if message.event != "message" {
                 continue;
             }
+            self.queue.lock().await.accept(topic, &message)?;
+            *pending = Some(message.clone());
             match self.deliver(topic, &message).await {
-                Delivery::Success => self.advance_cursor(topic, &message.id).await,
-                Delivery::Permanent => {}
+                Delivery::Success => {
+                    self.acknowledge(topic, &message.id).await?;
+                    *pending = None;
+                }
+                Delivery::Permanent => {
+                    self.queue.lock().await.reject(topic, &message.id)?;
+                    self.advance_cursor(topic, &message.id).await;
+                    *pending = None;
+                }
                 Delivery::Transient => {
                     *pending = Some(message);
                     bail!("Delivery failed");
@@ -293,6 +327,11 @@ impl Forwarder {
             Delivery::Transient => state.transient_delivery_failures += 1,
         }
         result
+    }
+    async fn acknowledge(&self, topic: &str, id: &str) -> Result<()> {
+        self.queue.lock().await.acknowledge(topic, id)?;
+        self.advance_cursor(topic, id).await;
+        Ok(())
     }
     async fn advance_cursor(&self, topic: &str, cursor: &str) {
         Store::set_cursor(&self.store, topic, cursor, &self.config).await;

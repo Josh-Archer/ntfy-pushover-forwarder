@@ -13,6 +13,14 @@ fn config() -> Config {
         pushover_user_key: "user".into(),
         pushover_default_token: "app".into(),
         topics: vec!["alerts".into()],
+        queue_store_path: std::env::temp_dir()
+            .join(format!(
+                "ntfy-queue-test-{}-{}.json",
+                std::process::id(),
+                rand::random::<u64>()
+            ))
+            .to_string_lossy()
+            .into(),
         ..Config::default()
     }
 }

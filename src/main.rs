@@ -2,6 +2,7 @@ mod config;
 mod dedupe;
 mod forwarder;
 mod message;
+mod queue;
 use axum::{
     Json, Router,
     extract::State,
@@ -110,12 +111,12 @@ async fn metrics(
         (
             "pending_messages",
             "gauge",
-            "Messages being delivered or retained for retry in this process; excludes upstream ntfy backlog.",
+            "Messages being delivered or retained in the durable queue; excludes upstream ntfy backlog.",
         ),
         (
             "oldest_pending_age_seconds",
             "gauge",
-            "Monotonic age of the oldest locally pending message; zero when idle.",
+            "Age of the oldest locally pending message, including recovered queue age; zero when idle.",
         ),
         (
             "delivery_attempts_total",

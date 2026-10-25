@@ -393,6 +393,24 @@ class Compatibility(unittest.TestCase):
         self.assertEqual([p['message'] for p in posts], ['first', 'first', 'first', 'second'])
         self.assertTrue(any(since == 'first' for _, since, _ in self.api.subscriptions))
 
+    def test_durable_pending_recovers_after_kill_and_history_expiry(self):
+        with tempfile.TemporaryDirectory(prefix='ntfy-queue-') as directory:
+            path = str(Path(directory, 'queue.json'))
+            self.start(QueueStorePath=path, MaxRetries=1, ReconnectInitialDelayMilliseconds=5000)
+            self.api.responses = [500]
+            self.api.send(id='expired', message='durable payload')
+            self.posts(1)
+            wait_for(lambda: Path(path).exists())
+            self.worker.process.kill()
+            self.worker.process.wait()
+            self.worker.close()
+            self.worker = None
+            with self.api.condition:
+                self.api.history['alerts'].clear()
+            self.start(QueueStorePath=path)
+            self.assertEqual(self.posts(2)[1]['message'], 'durable payload')
+            wait_for(lambda: not json.loads(Path(path).read_text())['pending'])
+
     def test_permanent_failure_and_missing_id_do_not_block_following_messages(self):
         self.start()
         self.api.responses = [400, 200]
