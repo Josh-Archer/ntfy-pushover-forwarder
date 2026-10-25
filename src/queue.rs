@@ -371,4 +371,26 @@ mod tests {
         drop(q);
         assert!(Queue::open(&cfg).unwrap().pending("a").is_some());
     }
+    #[test]
+    fn delete_removes_only_target_dead_letter() {
+        let cfg = config();
+        let mut q = Queue::open(&cfg).unwrap();
+        for topic in ["a", "b", "c"] {
+            q.accept(topic, &Message::default()).unwrap();
+            q.reject(topic, "bad").unwrap();
+        }
+        let ids: Vec<String> = q.failed().iter().map(|e| e.queue_id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+        q.delete(&ids[1]).unwrap();
+        let left: Vec<String> = q.failed().iter().map(|e| e.queue_id.clone()).collect();
+        assert_eq!(left, vec![ids[0].clone(), ids[2].clone()]);
+        drop(q);
+        let reopened: Vec<String> = Queue::open(&cfg)
+            .unwrap()
+            .failed()
+            .iter()
+            .map(|e| e.queue_id.clone())
+            .collect();
+        assert_eq!(reopened, vec![ids[0].clone(), ids[2].clone()]);
+    }
 }
