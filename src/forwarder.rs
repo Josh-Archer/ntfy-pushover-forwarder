@@ -11,6 +11,7 @@ use reqwest::{
     Client, Url,
     multipart::{Form, Part},
 };
+use std::time::Instant;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tokio_util::{
@@ -35,6 +36,11 @@ pub struct TopicState {
     pub connected: bool,
     pub cursor: Option<String>,
     pub counters: [u64; 7],
+    pub last_successful_delivery_timestamp_seconds: i64,
+    pub pending_since: Option<Instant>,
+    pub delivery_attempts: u64,
+    pub permanent_delivery_failures: u64,
+    pub transient_delivery_failures: u64,
 }
 #[derive(Clone)]
 struct Image {
@@ -218,6 +224,13 @@ impl Forwarder {
             self.count(topic, 2).await;
             return Delivery::Success;
         }
+        self.topics
+            .lock()
+            .await
+            .get_mut(topic)
+            .unwrap()
+            .pending_since
+            .get_or_insert_with(Instant::now);
         let key = message.fingerprint(topic);
         match self
             .store
@@ -226,6 +239,12 @@ impl Forwarder {
             .begin(&key, &self.config, Utc::now())
         {
             Claim::Duplicate => {
+                self.topics
+                    .lock()
+                    .await
+                    .get_mut(topic)
+                    .unwrap()
+                    .pending_since = None;
                 self.count(topic, 3).await;
                 return Delivery::Success;
             }
@@ -235,6 +254,12 @@ impl Forwarder {
         let image = self.image(topic, message).await;
         let mut result = Delivery::Transient;
         for attempt in 0..self.config.max_retries {
+            self.topics
+                .lock()
+                .await
+                .get_mut(topic)
+                .unwrap()
+                .delivery_attempts += 1;
             let form = self.form(topic, message, image.as_ref());
             match self.post(form).await {
                 Ok(status) if status.is_success() => {
@@ -255,6 +280,19 @@ impl Forwarder {
         Store::complete(&self.store, &key, result == Delivery::Success, &self.config).await;
         self.count(topic, if result == Delivery::Success { 1 } else { 4 })
             .await;
+        let mut topics = self.topics.lock().await;
+        let state = topics.get_mut(topic).unwrap();
+        match result {
+            Delivery::Success => {
+                state.last_successful_delivery_timestamp_seconds = Utc::now().timestamp();
+                state.pending_since = None;
+            }
+            Delivery::Permanent => {
+                state.permanent_delivery_failures += 1;
+                state.pending_since = None;
+            }
+            Delivery::Transient => state.transient_delivery_failures += 1,
+        }
         result
     }
     async fn advance_cursor(&self, topic: &str, cursor: &str) {

@@ -101,6 +101,65 @@ async fn metrics(
             );
         }
     }
+    for (name, kind, help) in [
+        (
+            "last_successful_delivery_timestamp_seconds",
+            "gauge",
+            "Unix timestamp of the last successful Pushover message delivery; zero until the first success in this process.",
+        ),
+        (
+            "pending_messages",
+            "gauge",
+            "Messages being delivered or retained for retry in this process; excludes upstream ntfy backlog.",
+        ),
+        (
+            "oldest_pending_age_seconds",
+            "gauge",
+            "Monotonic age of the oldest locally pending message; zero when idle.",
+        ),
+        (
+            "delivery_attempts_total",
+            "counter",
+            "Message HTTP delivery attempts, excluding recovery alerts.",
+        ),
+        (
+            "permanent_delivery_failures_total",
+            "counter",
+            "Delivery batches ending in a permanent downstream rejection.",
+        ),
+        (
+            "transient_delivery_failures_total",
+            "counter",
+            "Delivery batches exhausting attempts after transient failures.",
+        ),
+    ] {
+        let _ = writeln!(text, "# HELP ntfy_forwarder_{name} {help}");
+        let _ = writeln!(text, "# TYPE ntfy_forwarder_{name} {kind}");
+        for (topic, state) in topics.iter() {
+            let topic = topic
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            let value = match name {
+                "last_successful_delivery_timestamp_seconds" => {
+                    state.last_successful_delivery_timestamp_seconds as f64
+                }
+                "pending_messages" => u8::from(state.pending_since.is_some()) as f64,
+                "oldest_pending_age_seconds" => state
+                    .pending_since
+                    .map(|since| since.elapsed().as_secs_f64())
+                    .unwrap_or_default(),
+                "delivery_attempts_total" => state.delivery_attempts as f64,
+                "permanent_delivery_failures_total" => state.permanent_delivery_failures as f64,
+                "transient_delivery_failures_total" => state.transient_delivery_failures as f64,
+                _ => unreachable!(),
+            };
+            let _ = writeln!(
+                text,
+                "ntfy_forwarder_{name}{{topic=\"{topic}\",destination=\"pushover\"}} {value}"
+            );
+        }
+    }
     (
         [(
             header::CONTENT_TYPE,

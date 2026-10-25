@@ -254,6 +254,65 @@ class Compatibility(unittest.TestCase):
         wait_for(lambda: len(self.api.posts) >= count)
         return [fields for fields, status in self.api.posts]
 
+    def metric(self, name, topic='alerts'):
+        prefix = f'ntfy_forwarder_{name}{{topic="{topic}",destination="pushover"}} '
+        return next(float(line[len(prefix):]) for line in self.worker.get_metrics().splitlines()
+                    if line.startswith(prefix))
+
+    def test_delivery_visibility_tracks_pending_retries_and_success(self):
+        self.start(MaxRetries=1, ReconnectInitialDelayMilliseconds=1500)
+        self.assertEqual(self.metric('last_successful_delivery_timestamp_seconds'), 0)
+        self.api.responses = [500, 200]
+        self.api.send(id='pending')
+        wait_for(lambda: self.metric('transient_delivery_failures_total') == 1)
+        self.assertEqual(self.metric('pending_messages'), 1)
+        first_age = self.metric('oldest_pending_age_seconds')
+        time.sleep(0.1)
+        self.assertGreater(self.metric('oldest_pending_age_seconds'), first_age)
+        self.assertEqual(self.metric('last_successful_delivery_timestamp_seconds'), 0)
+        self.posts(2)
+        wait_for(lambda: self.metric('last_successful_delivery_timestamp_seconds') > 0)
+        self.assertEqual(self.metric('pending_messages'), 0)
+        self.assertEqual(self.metric('oldest_pending_age_seconds'), 0)
+        self.assertEqual(self.metric('delivery_attempts_total'), 2)
+        self.assertEqual(self.metric('permanent_delivery_failures_total'), 0)
+
+    def test_skips_and_rejections_do_not_mark_delivery_success(self):
+        self.start(MinimumPriority=3)
+        self.api.send(id='filtered', priority=1)
+        wait_for(lambda: 'ntfy_forwarder_messages_dropped_priority_total{topic="alerts"} 1' in self.worker.get_metrics())
+        self.assertEqual(self.metric('delivery_attempts_total'), 0)
+        self.assertEqual(self.metric('last_successful_delivery_timestamp_seconds'), 0)
+        self.api.responses = [400, 200]
+        self.api.send(id='rejected')
+        wait_for(lambda: self.metric('permanent_delivery_failures_total') == 1)
+        self.assertEqual(self.metric('pending_messages'), 0)
+        self.assertEqual(self.metric('last_successful_delivery_timestamp_seconds'), 0)
+        self.api.send(id='accepted')
+        wait_for(lambda: self.metric('last_successful_delivery_timestamp_seconds') > 0)
+        timestamp = self.metric('last_successful_delivery_timestamp_seconds')
+        time.sleep(1.1)
+        self.api.send(id='accepted')
+        wait_for(lambda: 'ntfy_forwarder_messages_dropped_dedupe_total{topic="alerts"} 1' in self.worker.get_metrics())
+        self.assertEqual(self.metric('last_successful_delivery_timestamp_seconds'), timestamp)
+        self.assertEqual(self.metric('delivery_attempts_total'), 2)
+        self.assertEqual(self.metric('pending_messages'), 0)
+
+    def test_delivery_visibility_resets_after_restart(self):
+        with tempfile.TemporaryDirectory(prefix='ntfy-metrics-') as directory:
+            path = str(Path(directory, 'dedupe.json'))
+            self.start(DeduplicationStorePath=path)
+            self.api.send(id='delivered')
+            wait_for(lambda: self.metric('last_successful_delivery_timestamp_seconds') > 0)
+            wait_for(lambda: Path(directory, 'cursors.json').exists())
+            self.worker.close()
+            self.worker = None
+            self.start(DeduplicationStorePath=path)
+            for metric in ['last_successful_delivery_timestamp_seconds', 'pending_messages',
+                           'oldest_pending_age_seconds', 'delivery_attempts_total',
+                           'permanent_delivery_failures_total', 'transient_delivery_failures_total']:
+                self.assertEqual(self.metric(metric), 0)
+
     def test_routing_formatting_priority_and_dedupe(self):
         self.start(TopicTokens={'alerts': 'specific'}, SoundMap={'siren': 'siren'}, MinimumPriority=3)
         self.api.send(priority=2)
