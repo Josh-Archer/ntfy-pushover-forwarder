@@ -37,6 +37,7 @@ class FakeAPI:
         self.condition = threading.Condition()
         self.history = {}
         self.posts = []
+        self.post_times = []
         self.subscriptions = []
         self.downloads = []
         self.responses = []
@@ -142,10 +143,16 @@ class FakeAPI:
                         fields['mime'] = part.get_content_type()
                 with api.condition:
                     code = api.responses.pop(0) if api.responses else 200
+                    retry_after = None
+                    if isinstance(code, tuple):
+                        code, retry_after = code
+                    api.post_times.append(time.monotonic())
                     api.posts.append((fields, code))
                     api.condition.notify_all()
                 data = json.dumps({'status': int(code == 200)}).encode()
                 self.send_response(code)
+                if retry_after is not None:
+                    self.send_header('Retry-After', retry_after)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
@@ -410,6 +417,31 @@ class Compatibility(unittest.TestCase):
             self.start(QueueStorePath=path)
             self.assertEqual(self.posts(2)[1]['message'], 'durable payload')
             wait_for(lambda: not json.loads(Path(path).read_text())['pending'])
+
+    def test_retry_after_survives_exhaustion_and_does_not_block_other_topics(self):
+        self.start(Topics=['alerts', 'other'], MaxRetries=1)
+        self.api.responses = [(429, '1'), 200, 200]
+        self.api.send('alerts', id='limited', message='limited')
+        self.posts(1)
+        self.api.send('other', id='independent', message='independent')
+        self.assertEqual(self.posts(2)[1]['message'], 'independent')
+        self.assertLess(self.api.post_times[1] - self.api.post_times[0], 0.8)
+        self.assertEqual(self.posts(3)[2]['message'], 'limited')
+        self.assertGreaterEqual(self.api.post_times[2] - self.api.post_times[0], 0.95)
+
+    def test_retry_after_deadline_survives_restart(self):
+        with tempfile.TemporaryDirectory(prefix='ntfy-retry-') as directory:
+            path = str(Path(directory, 'queue.json'))
+            self.start(QueueStorePath=path, MaxRetries=1)
+            self.api.responses = [(503, '2'), 200]
+            self.api.send(id='limited')
+            self.posts(1)
+            wait_for(lambda: json.loads(Path(path).read_text())['pending']['alerts']['next_attempt_at_ms'] > 0)
+            self.worker.close()
+            self.worker = None
+            self.start(QueueStorePath=path)
+            self.posts(2)
+            self.assertGreaterEqual(self.api.post_times[1] - self.api.post_times[0], 1.95)
 
     def test_permanent_failure_and_missing_id_do_not_block_following_messages(self):
         self.start()

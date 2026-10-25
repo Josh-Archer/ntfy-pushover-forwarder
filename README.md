@@ -65,7 +65,7 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 | `MaxRetries` | `3` total delivery attempts, minimum 1 |
 | `QueueStorePath` | Defaults to `queue.json` beside the dedupe file, or in the working directory; mount this directory on durable storage |
 | `QueueMaxBytes` | `67108864` (64 MiB); limits serialized pending, rejected, and cursor state |
-| `RetryDelayMilliseconds` | `0` |
+| `RetryDelayMilliseconds` | `0` selects a 1-second delivery backoff base; positive values retain their meaning as the base delay |
 | `ReconnectInitialDelayMilliseconds` | `1000`; capped at 60 seconds plus up to 20% jitter |
 
 `html` tags preserve markup. `markdown` or `md` tags HTML-escape the body and convert backtick spans to `<code>`. Formatting tags are case insensitive. Action buttons (`actions`) and `click` URLs map to Pushover `url` and `url_title` button fields, preferring the first `view` or `http` action with a URL (non-`view`/`http` actions such as `broadcast` are ignored). URLs are truncated to Pushover's 512-character limit, and button labels (`url_title`) are truncated to 100 characters. Images without an attachment use the first matching `LogoMap` tag, with `mag` as a fallback for topics containing `media`.
@@ -164,3 +164,12 @@ legacy cursors as fallback; no files are deleted. For rollback, stop the process
 pending work first, and back up the entire volume. Older versions cannot recover queue
 payloads; keep `queue.json` for a later upgrade. At-least-once delivery permits duplicates
 if a crash occurs after downstream acceptance but before durable acknowledgement.
+
+Delivery network errors, HTTP 429 and 5xx responses use exponential backoff with
+0–20% jitter, capped at 72 seconds including jitter. Valid `Retry-After` seconds
+or HTTP dates provide a minimum delay, capped at 24 hours; past dates mean zero,
+and malformed values fall back to backoff. Other 4xx responses remain permanent.
+Attempts and deadlines survive batch exhaustion (`MaxRetries`) and restart. Only
+successful handling resets a message's backoff. Each topic sleeps independently.
+SIGINT/SIGTERM cancels sleeps and requests immediately; accepted work remains on
+disk for restart (an interrupted request may have reached Pushover).

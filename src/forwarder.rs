@@ -286,7 +286,22 @@ impl Forwarder {
         }
         let image = self.image(topic, message).await;
         let mut result = Delivery::Transient;
-        for attempt in 0..self.config.max_retries {
+        for _ in 0..self.config.max_retries {
+            let deadline = self
+                .queue
+                .lock()
+                .await
+                .pending(topic)
+                .map(|e| e.next_attempt_at_ms)
+                .unwrap_or_default();
+            let remaining = deadline.saturating_sub(Utc::now().timestamp_millis());
+            if remaining > 0 {
+                tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
+            }
+            let attempt = match self.queue.lock().await.attempt(topic) {
+                Ok(attempt) => attempt,
+                Err(_) => break,
+            };
             self.topics
                 .lock()
                 .await
@@ -294,20 +309,24 @@ impl Forwarder {
                 .unwrap()
                 .delivery_attempts += 1;
             let form = self.form(topic, message, image.as_ref());
+            let mut retry_after = None;
             match self.post(form).await {
-                Ok(status) if status.is_success() => {
+                Ok((status, _)) if status.is_success() => {
                     result = Delivery::Success;
                     break;
                 }
-                Ok(status) if status.is_client_error() && status.as_u16() != 429 => {
+                Ok((status, _)) if status.is_client_error() && status.as_u16() != 429 => {
                     result = Delivery::Permanent;
                     break;
                 }
-                _ => {}
+                Ok((_, delay)) => retry_after = delay,
+                Err(_) => {}
             }
-            if attempt + 1 < self.config.max_retries && self.config.retry_delay_milliseconds > 0 {
-                tokio::time::sleep(Duration::from_millis(self.config.retry_delay_milliseconds))
-                    .await;
+            let delay = retry_delay(self.config.retry_delay_milliseconds, attempt, retry_after);
+            if self.queue.lock().await.defer(topic, delay).is_err() {
+                // Do not retry until storage can record the next deadline.
+                tokio::time::sleep(delay).await;
+                break;
             }
         }
         Store::complete(&self.store, &key, result == Delivery::Success, &self.config).await;
@@ -384,7 +403,7 @@ impl Forwarder {
         }
         form
     }
-    async fn post(&self, form: Form) -> reqwest::Result<reqwest::StatusCode> {
+    async fn post(&self, form: Form) -> reqwest::Result<(reqwest::StatusCode, Option<Duration>)> {
         let mut response = self
             .post_client
             .post(&self.config.pushover_url)
@@ -392,6 +411,11 @@ impl Forwarder {
             .send()
             .await?;
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| parse_retry_after(v, std::time::SystemTime::now()));
         // Drain small API responses to reuse pooled connections, without buffering or
         // logging response bodies that may contain account details.
         let mut read = 0usize;
@@ -401,7 +425,7 @@ impl Forwarder {
                 break;
             }
         }
-        Ok(status)
+        Ok((status, retry_after))
     }
     async fn recovery(&self, topic: &str) {
         let form = Form::new()
@@ -417,7 +441,7 @@ impl Forwarder {
         if self
             .post(form)
             .await
-            .is_ok_and(|status| status.is_success())
+            .is_ok_and(|(status, _)| status.is_success())
         {
             self.count(topic, 6).await;
         }
@@ -534,6 +558,23 @@ impl Forwarder {
         })
     }
 }
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+fn parse_retry_after(value: &str, now: std::time::SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    let delay = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        Duration::from_secs(value.parse::<u64>().unwrap_or(u64::MAX))
+    } else {
+        httpdate::parse_http_date(value)
+            .ok()?
+            .duration_since(now)
+            .unwrap_or_default()
+    };
+    Some(delay.min(MAX_RETRY_AFTER))
+}
+fn retry_delay(initial_ms: u64, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    backoff(if initial_ms == 0 { 1000 } else { initial_ms }, attempt)
+        .max(retry_after.unwrap_or_default())
+}
 fn same_origin(a: &Url, b: &Url) -> bool {
     a.scheme() == b.scheme()
         && a.host_str() == b.host_str()
@@ -550,6 +591,43 @@ fn backoff(initial_ms: u64, attempt: u32) -> Duration {
 mod tests {
     use super::*;
     use tokio_util::codec::Decoder;
+    #[test]
+    fn retry_headers_and_exponential_bounds() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(
+            parse_retry_after("120", now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_retry_after(&httpdate::fmt_http_date(now + Duration::from_secs(90)), now),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_retry_after(&httpdate::fmt_http_date(now - Duration::from_secs(1)), now),
+            Some(Duration::ZERO)
+        );
+        for bad in ["", "-1", "1.5", "tomorrow"] {
+            assert_eq!(parse_retry_after(bad, now), None);
+        }
+        assert_eq!(
+            parse_retry_after("9999999999999999999999999", SystemTime::now()),
+            Some(MAX_RETRY_AFTER)
+        );
+        for attempt in 0..30 {
+            let delay = retry_delay(0, attempt, None);
+            assert!(
+                delay
+                    >= Duration::from_millis(1000 * (1u64 << attempt.min(16)))
+                        .min(Duration::from_secs(60))
+            );
+            assert!(delay <= Duration::from_secs(72));
+        }
+        assert_eq!(
+            retry_delay(10, 0, Some(Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+    }
     #[test]
     fn backoff_is_bounded_and_jittered() {
         for attempt in 0..100 {

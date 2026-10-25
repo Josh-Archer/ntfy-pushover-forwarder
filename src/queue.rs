@@ -13,6 +13,10 @@ use std::{
 pub struct Entry {
     pub message: Message,
     pub accepted_at: i64,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub next_attempt_at_ms: i64,
     pub destinations: BTreeMap<String, String>,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -98,9 +102,29 @@ impl Queue {
             Entry {
                 message: message.clone(),
                 accepted_at: chrono::Utc::now().timestamp(),
+                attempts: 0,
+                next_attempt_at_ms: 0,
                 destinations: BTreeMap::from([("pushover".into(), "pending".into())]),
             },
         );
+        self.save(next)
+    }
+    pub fn attempt(&mut self, topic: &str) -> Result<u32> {
+        let mut next = self.state.clone();
+        let entry = next.pending.get_mut(topic).context("No pending delivery")?;
+        let attempt = entry.attempts;
+        entry.attempts = entry.attempts.saturating_add(1);
+        self.save(next)?;
+        Ok(attempt)
+    }
+    pub fn defer(&mut self, topic: &str, delay: std::time::Duration) -> Result<()> {
+        let mut next = self.state.clone();
+        next.pending
+            .get_mut(topic)
+            .context("No pending delivery")?
+            .next_attempt_at_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(delay.as_millis() as i64);
         self.save(next)
     }
     pub fn reject(&mut self, topic: &str, id: &str) -> Result<()> {
@@ -163,6 +187,18 @@ mod tests {
         let q = Queue::open(&cfg).unwrap();
         assert!(q.pending("alerts").is_none());
         assert_eq!(q.cursor("alerts"), Some(m.id.as_str()));
+    }
+    #[test]
+    fn retry_deadline_and_attempts_survive_restart() {
+        let cfg = config();
+        let mut q = Queue::open(&cfg).unwrap();
+        q.accept("a", &Message::default()).unwrap();
+        assert_eq!(q.attempt("a").unwrap(), 0);
+        q.defer("a", std::time::Duration::from_secs(120)).unwrap();
+        drop(q);
+        let mut q = Queue::open(&cfg).unwrap();
+        assert!(q.pending("a").unwrap().next_attempt_at_ms > chrono::Utc::now().timestamp_millis());
+        assert_eq!(q.attempt("a").unwrap(), 1);
     }
     #[test]
     fn full_or_failed_storage_does_not_mutate_accepted_work() {
