@@ -2,6 +2,7 @@ mod config;
 mod dedupe;
 mod forwarder;
 mod message;
+mod queue;
 use axum::{
     Json, Router,
     extract::State,
@@ -19,6 +20,23 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let config = config::Config::load(std::path::Path::new("appsettings.json"), std::env::vars())?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        anyhow::ensure!(
+            args.first().map(String::as_str) == Some("queue"),
+            "Usage: queue list | queue replay ID | queue delete ID"
+        );
+        let mut queue = queue::Queue::open(&config)?;
+        match args.get(1).map(String::as_str) {
+            Some("list") if args.len() == 2 => {
+                println!("{}", serde_json::to_string_pretty(queue.failed())?)
+            }
+            Some("replay") if args.len() == 3 => queue.replay(&args[2], &config.topics)?,
+            Some("delete") if args.len() == 3 => queue.delete(&args[2])?,
+            _ => anyhow::bail!("Usage: queue list | queue replay ID | queue delete ID"),
+        }
+        return Ok(());
+    }
     let port = config.http_port;
     let app = Forwarder::new(config)?;
     let mut tasks = tokio::task::JoinSet::new();
@@ -84,6 +102,10 @@ async fn health(State(app): State<Arc<Forwarder>>) -> (StatusCode, Json<serde_js
 async fn metrics(
     State(app): State<Arc<Forwarder>>,
 ) -> ([(header::HeaderName, &'static str); 1], String) {
+    let mut failed = std::collections::HashMap::<String, usize>::new();
+    for entry in app.queue.lock().await.failed() {
+        *failed.entry(entry.topic.clone()).or_default() += 1;
+    }
     let topics = app.topics.lock().await;
     let mut text = String::new();
     use std::fmt::Write;
@@ -103,6 +125,11 @@ async fn metrics(
     }
     for (name, kind, help) in [
         (
+            "dead_letter_messages",
+            "gauge",
+            "Durable permanent rejections retained for explicit replay or deletion.",
+        ),
+        (
             "last_successful_delivery_timestamp_seconds",
             "gauge",
             "Unix timestamp of the last successful Pushover message delivery; zero until the first success in this process.",
@@ -110,12 +137,12 @@ async fn metrics(
         (
             "pending_messages",
             "gauge",
-            "Messages being delivered or retained for retry in this process; excludes upstream ntfy backlog.",
+            "Messages being delivered or retained in the durable queue; excludes upstream ntfy backlog.",
         ),
         (
             "oldest_pending_age_seconds",
             "gauge",
-            "Monotonic age of the oldest locally pending message; zero when idle.",
+            "Age of the oldest locally pending message, including recovered queue age; zero when idle.",
         ),
         (
             "delivery_attempts_total",
@@ -136,11 +163,13 @@ async fn metrics(
         let _ = writeln!(text, "# HELP ntfy_forwarder_{name} {help}");
         let _ = writeln!(text, "# TYPE ntfy_forwarder_{name} {kind}");
         for (topic, state) in topics.iter() {
+            let dead_letters = failed.get(topic).copied().unwrap_or_default();
             let topic = topic
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
                 .replace('\n', "\\n");
             let value = match name {
+                "dead_letter_messages" => dead_letters as f64,
                 "last_successful_delivery_timestamp_seconds" => {
                     state.last_successful_delivery_timestamp_seconds as f64
                 }

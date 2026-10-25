@@ -13,10 +13,10 @@ One Tokio runtime thread handles the subscriptions, HTTP clients, health endpoin
 - An 8 MiB shared logo cache; a 1 MiB limit per incoming JSON line. Image bytes are shared between upload attempts instead of copied.
 - Deduplication uses ntfy message IDs, with shared in-flight reservations across topics and optional file persistence. Successful deliveries are recorded; failures release the reservation.
 - Bounded retries for network errors, HTTP 429 and server errors. Other HTTP 4xx responses are permanent failures and allow processing to continue.
-- Reconnects use exponential backoff with jitter and `since=<last handled ID>`. A topic with no saved cursor (first start, or after its cursor is lost) requests `since=<InitialSince>` (default `10m`, empty for live-only). Per-topic cursors are saved in `cursors.json` beside the dedupe file only when `DeduplicationStorePath` is configured, and are restored after restart. The dedupe path cannot be named `cursors.json`. A failed message is retained in memory for retry before resubscribing, including when it is the first message and there is no cursor yet.
+- Reconnects use exponential backoff with jitter and `since=<last handled ID>`. A topic with no saved cursor (first start, or after its cursor is lost) requests `since=<InitialSince>` (default `10m`, empty for live-only). Per-topic cursors are saved in `cursors.json` beside the dedupe file only when `DeduplicationStorePath` is configured, and are restored after restart. The dedupe path cannot be named `cursors.json`. Accepted messages are persisted before delivery and recovered before resubscribing, including when upstream history has expired.
 - Optional recovery alerts, `/healthz`, and Prometheus `/metrics` with per-topic counters.
 
-Delivery remains at least once: if Pushover accepts a request but its response is lost, a retry can send a duplicate. Pending messages are retained in memory and are not a durable delivery queue. Cursor persistence requires `DeduplicationStorePath` and stores only the last successfully handled ntfy ID for each topic.
+Delivery remains at least once: if Pushover accepts a request but its response is lost, a retry can send a duplicate. The durable queue retains one pending payload per topic, with per-destination state and atomic acknowledgement/cursor updates. Permanent rejections are retained on disk. Intake for a topic pauses behind its pending message; upstream messages not yet accepted still depend on ntfy retention.
 
 ## Run
 
@@ -57,13 +57,15 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 | `MinimumPriority` | `1`; omitted ntfy priorities are treated as `3` |
 | `DeduplicationWindowSeconds` | `300`; zero disables dedupe |
 | `DeduplicationMaxEntries` | `1024`, minimum 1 |
-| `DeduplicationStorePath` | Empty disables dedupe and cursor persistence; when set, cursors use a sibling `cursors.json` file (the dedupe file must have a different name) |
+| `DeduplicationStorePath` | Empty disables legacy dedupe/cursor files; the durable queue still persists cursors. When set, legacy cursors use a sibling `cursors.json` file |
 | `InitialSince` | ntfy `since` used for a topic with no saved cursor (default `10m`; empty streams live-only) |
 | `SendRecoveryAlerts` | `true` |
 | `HttpPort` | `8080`; zero disables the HTTP listener |
 | `MaxAttachmentBytes` | `2621440`; negative values restore the default |
 | `MaxRetries` | `3` total delivery attempts, minimum 1 |
-| `RetryDelayMilliseconds` | `0` |
+| `QueueStorePath` | Defaults to `queue.json` beside the dedupe file, or in the working directory; mount this directory on durable storage |
+| `QueueMaxBytes` | `67108864` (64 MiB); limits serialized pending, rejected, and cursor state |
+| `RetryDelayMilliseconds` | `0` selects a 1-second delivery backoff base; positive values retain their meaning as the base delay |
 | `ReconnectInitialDelayMilliseconds` | `1000`; capped at 60 seconds plus up to 20% jitter |
 
 `html` tags preserve markup. `markdown` or `md` tags HTML-escape the body and convert backtick spans to `<code>`. Formatting tags are case insensitive. Action buttons (`actions`) and `click` URLs map to Pushover `url` and `url_title` button fields, preferring the first `view` or `http` action with a URL (non-`view`/`http` actions such as `broadcast` are ignored). URLs are truncated to Pushover's 512-character limit, and button labels (`url_title`) are truncated to 100 characters. Images without an attachment use the first matching `LogoMap` tag, with `mag` as a fallback for topics containing `media`.
@@ -85,7 +87,7 @@ Existing `ntfy_forwarder_*_total{topic="..."}` counters retain their labels and 
 
 These metrics reset on restart. Pending age spans retries and reconnect waits, and includes image download time. Filtered messages, deduplicated messages, and recovery alerts do not update the successful-delivery timestamp. Invalid messages without IDs remain covered by the existing `forward_failures_total` counter. A transient error followed by success within the same batch increments attempts but not the exhausted-batch counter.
 
-`pending_messages` describes only work held by this process, not unread messages in ntfy. Durable queue depth, dead-letter counts, and additional destinations will be added with those features.
+`pending_messages` includes recovered durable work and excludes unread messages in ntfy. `dead_letter_messages` counts retained permanent failures. Only the Pushover destination is implemented.
 
 Example Prometheus alert expressions (apply your normal alert duration):
 
@@ -100,7 +102,7 @@ increase(ntfy_forwarder_transient_delivery_failures_total[10m]) > 3
 increase(ntfy_forwarder_permanent_delivery_failures_total[10m]) > 0
 ```
 
-Do not alert on an old last-success timestamp alone: an idle topic can be healthy. Monitor scrape availability separately, since process restarts clear these in-memory gauges.
+Do not alert on an old last-success timestamp alone: an idle topic can be healthy. Monitor scrape availability separately, since process restarts clear delivery timestamps and counters; pending work and dead-letter gauges recover from disk.
 
 ## Container and Helm
 
@@ -148,3 +150,59 @@ python3 scripts/integration.py --benchmark -- "$PWD/target/release/ntfy-pushover
 Add `--persistent` to include a dedupe file write after each delivery. See [measured results](docs/resource-comparison.md), [cluster validation](docs/cluster-validation-2026-10-16.md), and raw runs for the .NET comparison.
 
 The harness reports RSS and process CPU seconds using `/proc`, plus wall time. The same command can run a published .NET baseline by passing its `dotnet` executable and DLL instead. These local measurements do not establish production savings; remeasure container CPU/memory with representative traffic before reducing Kubernetes limits.
+
+Durable queue operations require one process per queue directory (an advisory lock rejects
+concurrent writers). Snapshots use file fsync, atomic rename, and directory fsync on a
+local filesystem supporting these operations. Reserve space for both the old snapshot
+and its replacement. Corrupt queue files fail startup; restore a backup instead of
+starting empty. Full storage or write errors pause acceptance and acknowledgement;
+alerts are never evicted to make room. Monitor logs and provision storage before ntfy
+retention expires. After an I/O error, repair storage and restart: a rename may
+have committed before a directory fsync failed, so the process refuses further writes
+until disk state is reloaded. The queue stores notification content: restrict volume access.
+
+Existing dedupe and cursor files retain their formats. On upgrade the queue imports
+legacy cursors as fallback; no files are deleted. For rollback, stop the process, drain
+pending work first, and back up the entire volume. Older versions cannot recover queue
+payloads; keep `queue.json` for a later upgrade. At-least-once delivery permits duplicates
+if a crash occurs after downstream acceptance but before durable acknowledgement.
+
+Delivery network errors, HTTP 429 and 5xx responses use exponential backoff with
+0–20% jitter, capped at 72 seconds including jitter. Valid `Retry-After` seconds
+or HTTP dates provide a minimum delay, capped at 24 hours; past dates mean zero,
+and malformed values fall back to backoff. Other 4xx responses remain permanent.
+Attempts and deadlines survive batch exhaustion (`MaxRetries`) and restart. Only
+successful handling resets a message's backoff. Each topic sleeps independently.
+SIGINT/SIGTERM cancels sleeps and requests immediately; accepted work remains on
+disk for restart (an interrupted request may have reached Pushover).
+
+Permanent failures retain the original payload, topic, queue ID, destination state,
+attempt count, first/last attempt timestamps, rejection timestamp, and a safe reason
+(`HTTP <status>` or invalid ntfy ID). Response bodies and credentials are not stored.
+The `ntfy_forwarder_dead_letter_messages{topic,destination="pushover"}` gauge counts
+retained failures across restart; existing failure counters remain process-local.
+
+Stop the service before operating on its queue (including listing), and run the
+same binary with the same configuration, working directory, volume, and user:
+
+```sh
+ntfy-pushover-forwarder queue list
+ntfy-pushover-forwarder queue replay QUEUE_ID
+ntfy-pushover-forwarder queue delete QUEUE_ID
+```
+
+`list` prints JSON including private payloads; handle its output as sensitive data.
+Fix the destination configuration before replaying. Replay moves exactly one selected
+failure back to its topic's pending slot; drain that slot first. Restart the service
+to deliver it. The operation is atomic and uses the same single-writer lock. Replay
+bypasses dedupe and priority filtering, preserves successful destination states, and
+never rewinds the ingestion cursor. Only the failed Pushover destination is selected;
+Grok routing is not implemented. A failed replay returns to retained failures with
+updated metadata. A crash after downstream acceptance can still cause a duplicate.
+
+Retention is explicit: failures never expire or get evicted automatically. All retained
+failures share `QueueMaxBytes` with pending work and cursors. When full, intake pauses;
+inspect and replay, explicitly delete selected failures, or increase storage and the
+limit. `delete` is irreversible; export `queue list` to protected storage first when
+an audit copy is needed. Removing a topic from configuration leaves its work on disk;
+restore the topic to deliver/replay it.

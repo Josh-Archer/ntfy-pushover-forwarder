@@ -131,7 +131,7 @@ fn cursor_path(config: &Config) -> std::path::PathBuf {
     }
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
