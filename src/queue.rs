@@ -91,6 +91,16 @@ impl Queue {
             _lock: lock,
         })
     }
+    /// Test hook: point writes at `path` and clear the write-failure latch.
+    #[cfg(test)]
+    pub(crate) fn set_path_for_test(&mut self, path: PathBuf) {
+        self.path = path;
+        self.write_failed = false;
+    }
+    #[cfg(test)]
+    pub(crate) fn path_for_test(&self) -> PathBuf {
+        self.path.clone()
+    }
     fn save(&mut self, next: Snapshot) -> Result<()> {
         ensure!(
             !self.write_failed,
