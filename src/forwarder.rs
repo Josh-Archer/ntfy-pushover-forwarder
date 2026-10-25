@@ -964,11 +964,7 @@ mod tests {
 
         #[tokio::test]
         async fn dedupe_dropped_messages_skip_grok_bot() {
-            let (mut app, fake) = setup(200, 200).await;
-            Arc::get_mut(&mut app)
-                .unwrap()
-                .config
-                .deduplication_window_seconds = 300;
+            let (app, fake) = setup_with_dedupe(200, 200, 300).await;
             let first = alert("d1");
             accept(&app, &first).await;
             assert_eq!(app.deliver("alerts", &first).await, Delivery::Success);
@@ -980,6 +976,40 @@ mod tests {
             assert_eq!(app.deliver("alerts", &dup).await, Delivery::Success);
             assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
             assert_eq!(grok_state(&app).await.as_deref(), Some("pending"));
+        }
+
+        #[tokio::test]
+        async fn failed_grok_persist_is_suppressed_then_retried() {
+            let (app, fake) = setup(200, 200).await;
+            let m = alert("p1");
+            accept(&app, &m).await;
+            // Make queue.mark fail for real: the store path's parent is a regular file,
+            // which fails even as root (unlike a chmod'd read-only directory).
+            let good = app.queue.lock().await.path_for_test();
+            app.queue
+                .lock()
+                .await
+                .set_path_for_test(good.join("invalid-child"));
+            // Pushover persistence fails too, so the overall result is Transient.
+            app.deliver("alerts", &m).await;
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                app.grok_bot_unsaved.lock().await.get("alerts/p1").copied(),
+                Some("delivered")
+            );
+            // Still unwritable: a second attempt must not resend.
+            // Pushover persistence fails too, so the overall result is Transient.
+            app.deliver("alerts", &m).await;
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("pending"));
+            // Storage repaired: the retry persists the outcome and clears the map.
+            app.queue.lock().await.set_path_for_test(good.clone());
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("delivered"));
+            assert!(app.grok_bot_unsaved.lock().await.is_empty());
+            let on_disk = std::fs::read_to_string(&good).unwrap();
+            assert!(on_disk.contains("delivered"));
         }
 
         #[tokio::test]
