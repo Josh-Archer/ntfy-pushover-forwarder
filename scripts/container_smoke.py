@@ -22,7 +22,8 @@ try:
         config.write_text(json.dumps({'Forwarder': dict(
             NtfyUrl=api.url, Topics=['alerts'], PushoverUrl=api.url + '/pushover',
             PushoverUserKey='fake-user', PushoverDefaultToken='fake-token', HttpPort=port,
-            DeduplicationStorePath='/data/dedupe.json', SendRecoveryAlerts=False)}))
+            DeduplicationStorePath='/data/dedupe.json', QueueEnabled=True,
+            QueueStorePath='/data/queue.json', SendRecoveryAlerts=False)}))
         subprocess.run(['docker', 'run', '-d', '--name', name, '--network', 'host',
                         '--read-only', '--cap-drop=ALL', '--tmpfs', '/data:uid=1654,gid=1654,mode=0700',
                         '--mount', f'type=bind,src={config},dst=/app/appsettings.json,readonly', image],
@@ -39,6 +40,16 @@ try:
             api.send(id='container-smoke')
             wait_for(lambda: api.posts)
             wait_for(lambda: subprocess.run(['docker', 'exec', name, 'test', '-s', '/data/dedupe.json']).returncode == 0)
+            def checkpointed():
+                try:
+                    snapshot = json.loads(subprocess.check_output(['docker', 'exec', name, 'cat', '/data/queue.json']))
+                    cursors = json.loads(subprocess.check_output(['docker', 'exec', name, 'cat', '/data/cursors.json']))
+                    return (snapshot['completed'].get('alerts') == 'container-smoke'
+                            and cursors.get('alerts') == 'container-smoke' and not snapshot['entries'])
+                except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError):
+                    return False
+
+            wait_for(checkpointed)
             info = json.loads(subprocess.check_output(['docker', 'inspect', name]))[0]
             assert info['Config']['User'] == '1654:1654'
             subprocess.run(['docker', 'kill', '--signal=TERM', name], check=True, stdout=subprocess.DEVNULL)

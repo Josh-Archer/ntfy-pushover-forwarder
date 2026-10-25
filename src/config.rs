@@ -15,6 +15,10 @@ pub struct Config {
     pub deduplication_window_seconds: i64,
     pub deduplication_max_entries: usize,
     pub deduplication_store_path: String,
+    pub queue_enabled: bool,
+    pub queue_store_path: String,
+    pub queue_max_bytes: usize,
+    pub queue_max_entries: usize,
     pub send_recovery_alerts: bool,
     /// ntfy `since` value used for a topic with no saved cursor (empty = live only).
     pub initial_since: String,
@@ -40,6 +44,10 @@ impl Default for Config {
             deduplication_window_seconds: 300,
             deduplication_max_entries: 1024,
             deduplication_store_path: String::new(),
+            queue_enabled: false,
+            queue_store_path: String::new(),
+            queue_max_bytes: 8_388_608,
+            queue_max_entries: 10_000,
             send_recovery_alerts: true,
             initial_since: "10m".into(),
             http_port: 8080,
@@ -143,6 +151,51 @@ impl Config {
             "A Pushover token is required for each topic"
         );
         config.deduplication_max_entries = config.deduplication_max_entries.max(1);
+        ensure!(
+            config.queue_max_bytes >= 1024,
+            "QueueMaxBytes must be at least 1024"
+        );
+        ensure!(
+            config.queue_max_entries > 0,
+            "QueueMaxEntries must be greater than zero"
+        );
+        if config.queue_enabled {
+            ensure!(
+                !config.queue_store_path.is_empty(),
+                "QueueStorePath is required when QueueEnabled is true"
+            );
+            let queue_path = normalized_path(Path::new(&config.queue_store_path));
+            let queue_temp =
+                normalized_path(Path::new(&format!("{}.tmp", config.queue_store_path)));
+            let dedupe_path = normalized_path(Path::new(&config.deduplication_store_path));
+            let legacy_cursor = normalized_path(&dedupe_cursor_path(Path::new(
+                &config.deduplication_store_path,
+            )));
+            let dedupe_temp = normalized_path(Path::new(&format!(
+                "{}.tmp",
+                config.deduplication_store_path
+            )));
+            let cursor_temp = normalized_path(&legacy_cursor.with_file_name(format!(
+                "{}.tmp",
+                legacy_cursor.file_name().unwrap_or_default().to_string_lossy()
+            )));
+            ensure!(
+                queue_path != dedupe_path
+                    && queue_path != legacy_cursor
+                    && queue_path != dedupe_temp
+                    && queue_path != cursor_temp
+                    && queue_temp != dedupe_path
+                    && queue_temp != legacy_cursor
+                    && queue_temp != dedupe_temp
+                    && queue_temp != cursor_temp,
+                "QueueStorePath must differ from dedupe, cursor, and temporary files"
+            );
+            ensure!(
+                Path::new(&config.queue_store_path).file_name()
+                    != Some(std::ffi::OsStr::new("cursors.json")),
+                "QueueStorePath cannot be named cursors.json"
+            );
+        }
         config.max_retries = config.max_retries.max(1);
         if config.max_attachment_bytes < 0 {
             config.max_attachment_bytes = 2_621_440;
@@ -157,6 +210,43 @@ impl Config {
             .get(topic)
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.pushover_default_token)
+    }
+}
+fn normalized_path(path: &Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        canonical
+    } else if let Some(canonical) = normalized
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+    {
+        canonical.join(normalized.file_name().unwrap_or_default())
+    } else {
+        normalized
+    }
+}
+fn dedupe_cursor_path(dedupe: &Path) -> std::path::PathBuf {
+    if dedupe
+        .file_name()
+        .is_some_and(|name| name == "cursors.json")
+    {
+        dedupe.with_file_name("forwarder-cursors.json")
+    } else {
+        dedupe.with_file_name("cursors.json")
     }
 }
 fn validate_url(s: &str) -> Result<()> {

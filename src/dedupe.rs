@@ -52,19 +52,44 @@ impl Store {
     pub fn cursor(&self, topic: &str) -> Option<&str> {
         self.cursors.get(topic).map(String::as_str)
     }
-    pub async fn set_cursor(store: &Mutex<Self>, topic: &str, cursor: &str, config: &Config) {
-        let mut store = store.lock().await;
-        store.cursors.insert(topic.into(), cursor.into());
+    pub fn cursor_snapshot(&self) -> HashMap<String, String> {
+        self.cursors.clone()
+    }
+    pub fn sync_completed_cursors(
+        &mut self,
+        completed: &HashMap<String, String>,
+        config: &Config,
+    ) -> anyhow::Result<()> {
         if config.deduplication_store_path.is_empty() {
-            return;
+            return Ok(());
+        }
+        let mut cursors = self.cursors.clone();
+        cursors.extend(completed.clone());
+        let data = serde_json::to_vec(&cursors)?;
+        atomic_write(&cursor_path(config), &data)?;
+        self.cursors = cursors;
+        Ok(())
+    }
+    pub async fn set_cursor(
+        store: &Mutex<Self>,
+        topic: &str,
+        cursor: &str,
+        config: &Config,
+    ) -> anyhow::Result<()> {
+        let mut store = store.lock().await;
+        if config.deduplication_store_path.is_empty() {
+            store.cursors.insert(topic.into(), cursor.into());
+            return Ok(());
         }
         let path = cursor_path(config);
-        let result = serde_json::to_vec(&store.cursors)
+        let mut cursors = store.cursors.clone();
+        cursors.insert(topic.into(), cursor.into());
+        let result = serde_json::to_vec(&cursors)
             .map_err(anyhow::Error::from)
             .and_then(|data| atomic_write(&path, &data));
-        if result.is_err() {
-            tracing::warn!("Cannot persist cursor file");
-        }
+        result?;
+        store.cursors = cursors;
+        Ok(())
     }
     pub fn begin(&mut self, key: &str, config: &Config, now: DateTime<Utc>) -> Claim {
         if config.deduplication_window_seconds <= 0 {

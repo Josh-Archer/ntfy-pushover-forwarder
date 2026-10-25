@@ -173,8 +173,9 @@ class FakeAPI:
 
 
 class Process:
-    def __init__(self, api, command, persistent=False, **options):
-        self.temp = tempfile.TemporaryDirectory(prefix='ntfy-test-')
+    def __init__(self, api, command, persistent=False, durable=False, state_dir=None, **options):
+        self.temp = tempfile.TemporaryDirectory(prefix='ntfy-test-') if state_dir is None else None
+        self.directory = state_dir or self.temp.name
         # A bound socket supplies an unused ephemeral health port.
         import socket
         with socket.socket() as sock:
@@ -186,14 +187,16 @@ class Process:
                            SendRecoveryAlerts=False, HttpPort=port, MaxRetries=2, RetryDelayMilliseconds=10,
                            ReconnectInitialDelayMilliseconds=50, **{})
         if persistent:
-            self.config['DeduplicationStorePath'] = str(Path(self.temp.name, 'dedupe.json'))
+            self.config['DeduplicationStorePath'] = str(Path(self.directory, 'dedupe.json'))
+        if durable:
+            self.config.update(QueueEnabled=True, QueueStorePath=str(Path(self.directory, 'queue.json')))
         self.config.update(options)
-        Path(self.temp.name, 'appsettings.json').write_text(json.dumps({'Forwarder': self.config}))
+        Path(self.directory, 'appsettings.json').write_text(json.dumps({'Forwarder': self.config}))
         env = {k: v for k, v in os.environ.items() if not k.lower().startswith('forwarder__')}
         env['RUST_LOG'] = 'error'
         env['Logging__LogLevel__Default'] = 'Error'
         self.log = tempfile.TemporaryFile()
-        self.process = subprocess.Popen(command, cwd=self.temp.name, env=env, stdout=self.log, stderr=self.log)
+        self.process = subprocess.Popen(command, cwd=self.directory, env=env, stdout=self.log, stderr=self.log)
         self.api = api
         try:
             wait_for(lambda: self.health() == 'Healthy')
@@ -223,7 +226,7 @@ class Process:
         cpu = (int(fields[13]) + int(fields[14])) / os.sysconf('SC_CLK_TCK')
         return rss, cpu
 
-    def close(self):
+    def stop(self):
         self.process.terminate()
         try:
             self.process.wait(timeout=5)
@@ -231,7 +234,11 @@ class Process:
             self.process.kill()
             self.process.wait()
         self.log.close()
-        self.temp.cleanup()
+
+    def close(self):
+        self.stop()
+        if self.temp:
+            self.temp.cleanup()
 
 
 COMMAND = []
@@ -465,6 +472,46 @@ class Compatibility(unittest.TestCase):
         self.assertEqual(posts[1]['title'], 'ntfy recovered: alerts')
         self.assertTrue(any(since == 'checkpoint' for _, since, _ in self.api.subscriptions))
         self.assertTrue(all(auth == 'Bearer test-ntfy-token' for _, _, auth in self.api.subscriptions))
+
+    def test_durable_queue_recovers_after_ntfy_history_expires(self):
+        with tempfile.TemporaryDirectory(prefix='ntfy-durable-') as directory:
+            self.api.responses = [503] * 1000
+            self.start(durable=True, state_dir=directory)
+            messages = [self.api.send(message=f'durable-{i}') for i in range(8)]
+            queue_path = Path(directory, 'queue.json')
+            wait_for(lambda: len(json.loads(queue_path.read_text())['entries']) == len(messages))
+            self.worker.process.kill()
+            self.worker.process.wait(timeout=5)
+            self.worker.stop()
+            self.worker = None
+            with self.api.condition:
+                self.api.history['alerts'].clear()
+                self.api.posts.clear()
+                self.api.responses.clear()
+            self.start(durable=True, state_dir=directory)
+            posts = self.posts(len(messages))
+            self.assertEqual([post['message'] for post in posts], [f'durable-{i}' for i in range(8)])
+            wait_for(lambda: not json.loads(queue_path.read_text())['entries'])
+            snapshot = json.loads(queue_path.read_text())
+            self.assertEqual(snapshot['completed']['alerts'], messages[-1])
+
+    def test_durable_permanent_failure_is_retained_and_blocks_topic_order(self):
+        with tempfile.TemporaryDirectory(prefix='ntfy-durable-rejected-') as directory:
+            self.api.responses = [400]
+            self.start(durable=True, state_dir=directory, Topics=['alerts', 'other'])
+            self.api.send(id='rejected', message='first')
+            self.api.send(id='later', message='second')
+            path = Path(directory, 'queue.json')
+            wait_for(lambda: len(json.loads(path.read_text())['entries']) == 2
+                     and json.loads(path.read_text())['entries'][0]['destinations']['pushover'] == 'rejected')
+            self.assertEqual([fields['message'] for fields, _ in self.api.posts], ['first'])
+            self.api.send('other', id='independent', message='other-topic')
+            self.assertEqual(self.posts(2)[1]['message'], 'other-topic')
+            wait_for(lambda: all(entry['topic'] == 'alerts' for entry in json.loads(path.read_text())['entries']))
+            self.worker.close()
+            self.worker = None
+            entries = json.loads(path.read_text())['entries']
+            self.assertEqual([entry['id'] for entry in entries], ['rejected', 'later'])
 
 
 def benchmark(command, messages, idle_seconds, persistent):

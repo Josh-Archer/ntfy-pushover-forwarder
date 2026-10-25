@@ -65,6 +65,10 @@ spec:
             {{- if .Values.persistence.enabled }}
             - name: Forwarder__DeduplicationStorePath
               value: {{ .Values.persistence.mountPath | default "/data" }}/dedupe.json
+            {{- if .Values.forwarder.queue.enabled }}
+            - name: Forwarder__QueueStorePath
+              value: {{ .Values.persistence.mountPath | default "/data" }}/queue.json
+            {{- end }}
             {{- end }}
             {{- if .Values.existingSecret }}
             - name: Forwarder__NtfyToken

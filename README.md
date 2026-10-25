@@ -12,11 +12,15 @@ One Tokio runtime thread handles the subscriptions, HTTP clients, health endpoin
 - Inline images and tag-based fallback logos. Downloads are limited to 2.5 MiB by default, including chunked responses. Only images are attached; a failed download still allows the text alert through.
 - An 8 MiB shared logo cache; a 1 MiB limit per incoming JSON line. Image bytes are shared between upload attempts instead of copied.
 - Deduplication uses ntfy message IDs, with shared in-flight reservations across topics and optional file persistence. Successful deliveries are recorded; failures release the reservation.
-- Bounded retries for network errors, HTTP 429 and server errors. Other HTTP 4xx responses are permanent failures and allow processing to continue.
-- Reconnects use exponential backoff with jitter and `since=<last handled ID>`. A topic with no saved cursor (first start, or after its cursor is lost) requests `since=<InitialSince>` (default `10m`, empty for live-only). Per-topic cursors are saved in `cursors.json` beside the dedupe file only when `DeduplicationStorePath` is configured, and are restored after restart. The dedupe path cannot be named `cursors.json`. A failed message is retained in memory for retry before resubscribing, including when it is the first message and there is no cursor yet.
+- Bounded retries for network errors, HTTP 429 and server errors. With the durable queue enabled, permanent Pushover 4xx failures remain on disk as rejected topic heads and stop later delivery for that topic. Other topics continue.
+- With the durable queue enabled, each ntfy event is fsynced with its raw payload before ingestion advances. Upstream ingestion cursors and completed-delivery cursors are separate. Messages are spooled in per-topic order while Pushover is unavailable, so recovery does not depend on ntfy retaining their history. A Pushover success and completed cursor are committed by an atomic queue snapshot replacement. A crash before that commit may resend a message, preserving at-least-once delivery.
+- Queue writes use a bounded JSON snapshot, fsynced temporary file, atomic rename and parent-directory fsync. Corrupt, oversized, incompatible or topic-orphaned queue files fail startup closed. When the queue reaches its byte or entry limit, subscription reads pause until the worker frees capacity; no queued event is evicted. Permanent failures remain durably retained and block later events on that topic until a future replay workflow is used.
+- Without the queue enabled, reconnects use exponential backoff with jitter and `since=<last handled ID>`. A topic with no saved cursor (first start, or after its cursor is lost) requests `since=<InitialSince>` (default `10m`, empty for live-only). Per-topic cursors are saved in `cursors.json` beside the dedupe file only when `DeduplicationStorePath` is configured, and are restored after restart. The dedupe path cannot be named `cursors.json`.
 - Optional recovery alerts, `/healthz`, and Prometheus `/metrics` with per-topic counters.
 
-Delivery remains at least once: if Pushover accepts a request but its response is lost, a retry can send a duplicate. Pending messages are retained in memory and are not a durable delivery queue. Cursor persistence requires `DeduplicationStorePath` and stores only the last successfully handled ntfy ID for each topic.
+Delivery remains at least once: if Pushover accepts a request but its response is lost before the queue checkpoint is committed, a retry can send a duplicate. Queue persistence is opt-in in the core binary and enabled by default in Helm when PVC persistence is enabled. Queue capacity is measured as the serialized snapshot size, including payload and metadata; the default is 8 MiB and 10,000 entries. The atomic write can use up to roughly twice `QueueMaxBytes` on disk for the old snapshot plus temporary snapshot, in addition to dedupe and cursor files. Snapshot rewrites also need memory headroom; keep the default conservative or size the container for several copies of the configured queue bound.
+
+Queued payloads preserve attachment URLs, not attachment bytes. An attachment that expires during an outage still follows the existing text-only fallback. Events that have not yet been accepted because the queue is full remain dependent on ntfy retention.
 
 ## Run
 
@@ -58,6 +62,10 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 | `DeduplicationWindowSeconds` | `300`; zero disables dedupe |
 | `DeduplicationMaxEntries` | `1024`, minimum 1 |
 | `DeduplicationStorePath` | Empty disables dedupe and cursor persistence; when set, cursors use a sibling `cursors.json` file (the dedupe file must have a different name) |
+| `QueueEnabled` | `false`; enables durable ingest and delivery state |
+| `QueueStorePath` | Required when `QueueEnabled=true`; queue snapshot path on persistent storage |
+| `QueueMaxBytes` | `8388608`; serialized snapshot limit, minimum 1024 bytes |
+| `QueueMaxEntries` | `10000`; maximum pending and rejected messages, minimum 1 |
 | `InitialSince` | ntfy `since` used for a topic with no saved cursor (default `10m`; empty streams live-only) |
 | `SendRecoveryAlerts` | `true` |
 | `HttpPort` | `8080`; zero disables the HTTP listener |
@@ -110,7 +118,9 @@ helm upgrade --install ntfy-forwarder ./charts/ntfy-pushover-forwarder \
   --set image.tag=YOUR_RELEASE --set existingSecret=ntfy-secret
 ```
 
-The image runs as UID/GID 1654, preserving access to existing dedupe volumes. Helm retains its existing values, Secret keys, service, probes, single replica and Recreate strategy. Persistence supports one writer; do not share the dedupe file between replicas.
+The image runs as UID/GID 1654, preserving access to existing data volumes. With persistence enabled, Helm stores `dedupe.json`, `cursors.json` and `queue.json` under the existing PVC and enables the queue by default. Set `forwarder.queue.enabled=false` for the old in-memory delivery behavior. `QueueStorePath`'s parent directory must already exist on durable storage. The chart's single replica and Recreate strategy are required: only one process may write a queue snapshot. Do not share the PVC or queue file between replicas, or configure hard links or symlink aliases between the queue, dedupe and cursor files.
+
+To roll back to a binary that predates the queue, first ensure `queue.json` has no pending or rejected entries and that its `completed` cursor map matches the sibling `cursors.json` file. The queue-enabled binary syncs that legacy cursor mirror at startup and after each completed message, but a crash can occur between the atomic queue commit and the mirror write. If they differ, copy the completed cursor map into `cursors.json` using an atomic file replacement before rollback. An older binary ignores queued payloads and cannot recover a message whose ntfy history has expired. Preserve the volume and queue snapshot until rollback is complete. Queue files also retain message contents, so protect their volume with the same access controls as notification data.
 
 ## Migration from .NET
 

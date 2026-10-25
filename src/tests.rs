@@ -72,6 +72,46 @@ fn config_rejects_dedupe_file_named_cursors_json() {
         .is_err()
     );
 }
+
+#[test]
+fn durable_queue_config_rejects_colliding_paths_and_zero_limits() {
+    let root = std::env::temp_dir().join(format!("ntfy-queue-config-{}", std::process::id()));
+    let dedupe = root.join("dedupe.json");
+    let colliding = root.join("nested").join("..").join("dedupe.json");
+    let base = [
+        ("Forwarder__NtfyUrl", "http://localhost"),
+        ("Forwarder__PushoverUserKey", "user"),
+        ("Forwarder__PushoverDefaultToken", "app"),
+        ("Forwarder__Topics", "[\"alerts\"]"),
+        (
+            "Forwarder__DeduplicationStorePath",
+            dedupe.to_str().unwrap(),
+        ),
+        ("Forwarder__QueueEnabled", "true"),
+    ];
+    let mut env = base.to_vec();
+    env.push(("Forwarder__QueueStorePath", colliding.to_str().unwrap()));
+    assert!(
+        Config::load(
+            Path::new("/nonexistent"),
+            env.into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+        )
+        .is_err()
+    );
+
+    let env = base.into_iter().chain([
+        ("Forwarder__QueueStorePath", "/tmp/queue.json"),
+        ("Forwarder__QueueMaxEntries", "0"),
+    ]);
+    assert!(
+        Config::load(
+            Path::new("/nonexistent"),
+            env.map(|(key, value)| (key.into(), value.into()))
+        )
+        .is_err()
+    );
+}
 #[test]
 fn priority_defaults_and_full_mapping() {
     for (priority, expected) in [
@@ -434,8 +474,12 @@ async fn durable_cursors_restore_per_topic_after_restart() {
         ..config()
     };
     let store = tokio::sync::Mutex::new(Store::load(&cfg));
-    Store::set_cursor(&store, "alerts", "ntfy-id-1", &cfg).await;
-    Store::set_cursor(&store, "other", "ntfy-id-2", &cfg).await;
+    Store::set_cursor(&store, "alerts", "ntfy-id-1", &cfg)
+        .await
+        .unwrap();
+    Store::set_cursor(&store, "other", "ntfy-id-2", &cfg)
+        .await
+        .unwrap();
 
     let restarted = Store::load(&cfg);
     assert_eq!(restarted.cursor("alerts"), Some("ntfy-id-1"));
@@ -459,7 +503,9 @@ async fn cursor_temp_artifacts_do_not_replace_good_file_and_corrupt_file_is_safe
     };
     let cursor_path = dir.join("cursors.json");
     let store = tokio::sync::Mutex::new(Store::default());
-    Store::set_cursor(&store, "alerts", "good-cursor", &cfg).await;
+    Store::set_cursor(&store, "alerts", "good-cursor", &cfg)
+        .await
+        .unwrap();
 
     for torn_temp in [b"".as_slice(), b"{\"alerts\":\"partial".as_slice()] {
         std::fs::write(dir.join("cursors.json.tmp"), torn_temp).unwrap();

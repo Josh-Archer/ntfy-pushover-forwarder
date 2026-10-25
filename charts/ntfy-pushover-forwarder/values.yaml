@@ -71,6 +71,12 @@ forwarder:
   deduplicationWindowSeconds: 300
   deduplicationMaxEntries: 1024
 
+  # Durable queue is stored on the existing PVC when persistence is enabled.
+  queue:
+    enabled: true
+    maxBytes: 8388608
+    maxEntries: 10000
+
   # Send Pushover recovery notification after SSE reconnect following an outage
   sendRecoveryAlerts: true
 

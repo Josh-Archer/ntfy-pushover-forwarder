@@ -2,6 +2,7 @@ mod config;
 mod dedupe;
 mod forwarder;
 mod message;
+mod queue;
 use axum::{
     Json, Router,
     extract::State,
@@ -23,6 +24,9 @@ async fn main() -> anyhow::Result<()> {
     let app = Forwarder::new(config)?;
     let mut tasks = tokio::task::JoinSet::new();
     for topic in &app.config.topics {
+        if app.config.queue_enabled {
+            tasks.spawn(app.clone().drain(topic.clone()));
+        }
         tasks.spawn(app.clone().listen(topic.clone()));
     }
     if port > 0 {

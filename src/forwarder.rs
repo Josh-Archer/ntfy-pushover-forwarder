@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     dedupe::{Claim, Store},
     message::Message,
+    queue::{PUSHOVER, Queue},
 };
 use anyhow::{Result, bail};
 use bytes::Bytes;
@@ -51,6 +52,7 @@ pub struct Forwarder {
     pub config: Config,
     pub topics: Mutex<HashMap<String, TopicState>>,
     store: Mutex<Store>,
+    queue: Option<Queue>,
     icons: Mutex<HashMap<String, Image>>,
     stream_client: Client,
     post_client: Client,
@@ -70,13 +72,27 @@ impl Forwarder {
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
         };
-        let store = Store::load(&config);
+        let mut store = Store::load(&config);
+        let queue = if config.queue_enabled {
+            Some(Queue::load(&config, store.cursor_snapshot())?)
+        } else {
+            None
+        };
+        if let Some(queue) = &queue
+            && let Err(error) =
+                store.sync_completed_cursors(&queue.completed_cursors_startup(), &config)
+        {
+            tracing::warn!(error = %error, "Cannot sync legacy cursor copy at startup");
+        }
         let topics = config
             .topics
             .iter()
             .map(|t| {
                 let state = TopicState {
-                    cursor: store.cursor(t).map(str::to_owned),
+                    cursor: queue
+                        .as_ref()
+                        .and_then(|q| q.completed_cursor_startup(t))
+                        .or_else(|| store.cursor(t).map(str::to_owned)),
                     ..TopicState::default()
                 };
                 (t.clone(), state)
@@ -84,6 +100,7 @@ impl Forwarder {
             .collect();
         Ok(Arc::new(Self {
             store: Mutex::new(store),
+            queue,
             config,
             topics: Mutex::new(topics),
             icons: Mutex::new(HashMap::new()),
@@ -119,7 +136,11 @@ impl Forwarder {
                 }
                 pending = None;
             }
-            let cursor = self.topics.lock().await[&topic].cursor.clone();
+            let cursor = if let Some(queue) = &self.queue {
+                queue.ingest_cursor(&topic).await
+            } else {
+                self.topics.lock().await[&topic].cursor.clone()
+            };
             let result = self
                 .consume(
                     &topic,
@@ -192,14 +213,28 @@ impl Forwarder {
             if line.trim().is_empty() {
                 continue;
             }
-            let message: Message = match serde_json::from_str(&line) {
+            let payload: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(m) => m,
                 Err(_) => {
                     tracing::warn!(topic, "Invalid ntfy JSON line");
                     continue;
                 }
             };
+            let message: Message = match serde_json::from_value(payload.clone()) {
+                Ok(message) => message,
+                Err(_) => {
+                    tracing::warn!(topic, "Invalid ntfy message payload");
+                    continue;
+                }
+            };
             if message.event != "message" {
+                continue;
+            }
+            if let Some(queue) = &self.queue {
+                if let Err(error) = queue.enqueue(topic, message, payload).await {
+                    tracing::error!(topic, error = %error, "Cannot persist incoming message");
+                    bail!("Durable queue write failed");
+                }
                 continue;
             }
             match self.deliver(topic, &message).await {
@@ -295,8 +330,70 @@ impl Forwarder {
         result
     }
     async fn advance_cursor(&self, topic: &str, cursor: &str) {
-        Store::set_cursor(&self.store, topic, cursor, &self.config).await;
+        if let Err(error) = Store::set_cursor(&self.store, topic, cursor, &self.config).await {
+            tracing::warn!(topic, error = %error, "Cannot persist cursor file");
+        }
         self.topics.lock().await.get_mut(topic).unwrap().cursor = Some(cursor.into());
+    }
+
+    pub async fn drain(self: Arc<Self>, topic: String) {
+        let Some(queue) = self.queue.as_ref() else {
+            return;
+        };
+        let mut attempt = 0u32;
+        loop {
+            let entry = queue.head_or_wait(&topic).await;
+            let message = entry
+                .message()
+                .expect("queue payload was validated during startup");
+            let (result, rejected) = match self.deliver(&topic, &message).await {
+                Delivery::Success => (
+                    queue
+                        .complete_destination(&topic, &entry.id, PUSHOVER)
+                        .await,
+                    false,
+                ),
+                Delivery::Permanent => (
+                    queue
+                        .reject(&topic, &entry.id, PUSHOVER)
+                        .await
+                        .map(|()| false),
+                    true,
+                ),
+                Delivery::Transient => (
+                    Err(anyhow::anyhow!("Downstream delivery failed transiently")),
+                    false,
+                ),
+            };
+            let completed = match result {
+                Ok(completed) => completed,
+                Err(error) => {
+                    tracing::warn!(topic, error = %error, "Queue delivery/checkpoint will retry");
+                    tokio::time::sleep(backoff(
+                        self.config.reconnect_initial_delay_milliseconds,
+                        attempt,
+                    ))
+                    .await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
+            if rejected {
+                // A permanent failure is durably retained and blocks later messages.
+                continue;
+            }
+            if !completed {
+                continue;
+            }
+            if let Err(error) =
+                Store::set_cursor(&self.store, &topic, &entry.id, &self.config).await
+            {
+                // The queue checkpoint is authoritative; this copy supports rollback.
+                tracing::warn!(topic, error = %error, "Cannot sync legacy cursor copy");
+            }
+            self.topics.lock().await.get_mut(&topic).unwrap().cursor = Some(entry.id);
+            attempt = 0;
+        }
     }
     fn form(&self, topic: &str, message: &Message, image: Option<&Image>) -> Form {
         let (body, html) = message.formatted();
