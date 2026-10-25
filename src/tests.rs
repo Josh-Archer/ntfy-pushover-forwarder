@@ -522,3 +522,48 @@ fn stream_url_resumes_from_cursor_or_initial_window() {
         "http://localhost:9999/alerts/json"
     );
 }
+
+#[tokio::test]
+async fn delivery_metrics_escape_labels_and_report_pending_age() {
+    let topic = "quoted\"topic\\line\n";
+    let app = Forwarder::new(Config {
+        topics: vec![topic.into()],
+        ..config()
+    })
+    .unwrap();
+    {
+        let mut topics = app.topics.lock().await;
+        let state = topics.get_mut(topic).unwrap();
+        state.pending_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        state.last_successful_delivery_timestamp_seconds = 123;
+        state.delivery_attempts = 4;
+        state.permanent_delivery_failures = 1;
+        state.transient_delivery_failures = 2;
+    }
+    let (_, body) = metrics(State(app)).await;
+    let labels = r#"{topic="quoted\"topic\\line\n",destination="pushover"}"#;
+    for (name, expected) in [
+        ("pending_messages", 1.0),
+        ("last_successful_delivery_timestamp_seconds", 123.0),
+        ("delivery_attempts_total", 4.0),
+        ("permanent_delivery_failures_total", 1.0),
+        ("transient_delivery_failures_total", 2.0),
+    ] {
+        let prefix = format!("ntfy_forwarder_{name}{labels} ");
+        let value: f64 = body
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(value, expected);
+    }
+    let prefix = format!("ntfy_forwarder_oldest_pending_age_seconds{labels} ");
+    let age: f64 = body
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(age >= 5.0);
+}

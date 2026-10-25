@@ -70,6 +70,38 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 
 The ntfy token is sent only to same-origin message attachments, never to logos or other origins. HTTP redirects are disabled for subscriptions, API posts and image downloads; configure final URLs directly.
 
+## Delivery metrics
+
+Existing `ntfy_forwarder_*_total{topic="..."}` counters retain their labels and semantics. The following additional metrics use `topic` and `destination="pushover"` labels:
+
+| Metric (prefixed `ntfy_forwarder_`) | Meaning |
+|---|---|
+| `last_successful_delivery_timestamp_seconds` | Unix time of the last successful message delivery; zero until this process delivers a message |
+| `pending_messages` | 0 or 1 per topic: a message being delivered or retained for retry, including dedupe reservation waits |
+| `oldest_pending_age_seconds` | Monotonic time since the locally pending message first entered delivery; zero when idle |
+| `delivery_attempts_total` | HTTP delivery attempts, including retries; excludes recovery alerts |
+| `permanent_delivery_failures_total` | Delivery batches ending in a permanent downstream rejection |
+| `transient_delivery_failures_total` | Delivery batches that exhausted attempts after transient failures |
+
+These metrics reset on restart. Pending age spans retries and reconnect waits, and includes image download time. Filtered messages, deduplicated messages, and recovery alerts do not update the successful-delivery timestamp. Invalid messages without IDs remain covered by the existing `forward_failures_total` counter. A transient error followed by success within the same batch increments attempts but not the exhausted-batch counter.
+
+`pending_messages` describes only work held by this process, not unread messages in ntfy. Durable queue depth, dead-letter counts, and additional destinations will be added with those features.
+
+Example Prometheus alert expressions (apply your normal alert duration):
+
+```promql
+# A message has remained locally pending for more than five minutes.
+ntfy_forwarder_oldest_pending_age_seconds > 300
+
+# Repeated batches failed within ten minutes.
+increase(ntfy_forwarder_transient_delivery_failures_total[10m]) > 3
+
+# A downstream rejection needs investigation.
+increase(ntfy_forwarder_permanent_delivery_failures_total[10m]) > 0
+```
+
+Do not alert on an old last-success timestamp alone: an idle topic can be healthy. Monitor scrape availability separately, since process restarts clear these in-memory gauges.
+
 ## Container and Helm
 
 ```bash
