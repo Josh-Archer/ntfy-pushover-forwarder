@@ -52,7 +52,7 @@ pub struct Forwarder {
     pub config: Config,
     pub topics: Mutex<HashMap<String, TopicState>>,
     store: Mutex<Store>,
-    queue: Mutex<Queue>,
+    pub(crate) queue: Mutex<Queue>,
     icons: Mutex<HashMap<String, Image>>,
     stream_client: Client,
     post_client: Client,
@@ -139,7 +139,7 @@ impl Forwarder {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
-                        self.advance_cursor(&topic, &message.id).await;
+                        self.sync_cursor(&topic).await;
                     }
                 }
                 pending = None;
@@ -236,7 +236,7 @@ impl Forwarder {
                 }
                 Delivery::Permanent => {
                     self.queue.lock().await.reject(topic, &message.id)?;
-                    self.advance_cursor(topic, &message.id).await;
+                    self.sync_cursor(topic).await;
                     *pending = None;
                 }
                 Delivery::Transient => {
@@ -251,9 +251,25 @@ impl Forwarder {
         self.count(topic, 0).await;
         if message.id.trim().is_empty() {
             self.count(topic, 4).await;
-            return Delivery::Permanent;
+            return if self
+                .queue
+                .lock()
+                .await
+                .failure(topic, "Invalid empty ntfy ID".into())
+                .is_ok()
+            {
+                Delivery::Permanent
+            } else {
+                Delivery::Transient
+            };
         }
-        if message.priority.unwrap_or(3) < self.config.minimum_priority {
+        let replay = self
+            .queue
+            .lock()
+            .await
+            .pending(topic)
+            .is_some_and(|e| e.replay);
+        if !replay && message.priority.unwrap_or(3) < self.config.minimum_priority {
             self.count(topic, 2).await;
             return Delivery::Success;
         }
@@ -265,19 +281,15 @@ impl Forwarder {
             .pending_since
             .get_or_insert_with(std::time::Instant::now);
         let key = message.fingerprint(topic);
-        match self
-            .store
-            .lock()
-            .await
-            .begin(&key, &self.config, Utc::now())
-        {
+        match if replay {
+            Claim::Acquired
+        } else {
+            self.store
+                .lock()
+                .await
+                .begin(&key, &self.config, Utc::now())
+        } {
             Claim::Duplicate => {
-                self.topics
-                    .lock()
-                    .await
-                    .get_mut(topic)
-                    .unwrap()
-                    .pending_since = None;
                 self.count(topic, 3).await;
                 return Delivery::Success;
             }
@@ -316,7 +328,15 @@ impl Forwarder {
                     break;
                 }
                 Ok((status, _)) if status.is_client_error() && status.as_u16() != 429 => {
-                    result = Delivery::Permanent;
+                    if self
+                        .queue
+                        .lock()
+                        .await
+                        .failure(topic, format!("HTTP {}", status.as_u16()))
+                        .is_ok()
+                    {
+                        result = Delivery::Permanent;
+                    }
                     break;
                 }
                 Ok((_, delay)) => retry_after = delay,
@@ -337,11 +357,9 @@ impl Forwarder {
         match result {
             Delivery::Success => {
                 state.last_successful_delivery_timestamp_seconds = Utc::now().timestamp();
-                state.pending_since = None;
             }
             Delivery::Permanent => {
                 state.permanent_delivery_failures += 1;
-                state.pending_since = None;
             }
             Delivery::Transient => state.transient_delivery_failures += 1,
         }
@@ -349,8 +367,20 @@ impl Forwarder {
     }
     async fn acknowledge(&self, topic: &str, id: &str) -> Result<()> {
         self.queue.lock().await.acknowledge(topic, id)?;
-        self.advance_cursor(topic, id).await;
+        self.sync_cursor(topic).await;
         Ok(())
+    }
+    async fn sync_cursor(&self, topic: &str) {
+        self.topics
+            .lock()
+            .await
+            .get_mut(topic)
+            .unwrap()
+            .pending_since = None;
+        let cursor = self.queue.lock().await.cursor(topic).map(str::to_owned);
+        if let Some(cursor) = cursor {
+            self.advance_cursor(topic, &cursor).await;
+        }
     }
     async fn advance_cursor(&self, topic: &str, cursor: &str) {
         Store::set_cursor(&self.store, topic, cursor, &self.config).await;
