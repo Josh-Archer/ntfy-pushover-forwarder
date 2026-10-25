@@ -61,6 +61,9 @@ pub struct Forwarder {
     post_client: Client,
     image_client: Client,
     grok_client: Client,
+    /// Final Grok Bot outcomes whose queue write failed, keyed by `topic/id`. Consulted before
+    /// sending so a disk error does not cause a resend for the life of this process.
+    grok_bot_unsaved: Mutex<HashMap<String, &'static str>>,
 }
 #[derive(Debug, PartialEq)]
 enum Delivery {
@@ -109,6 +112,7 @@ impl Forwarder {
             post_client: base().timeout(Duration::from_secs(100)).build()?,
             image_client: base().timeout(Duration::from_secs(10)).build()?,
             grok_client: base().timeout(Duration::from_secs(8)).build()?,
+            grok_bot_unsaved: Mutex::new(HashMap::new()),
         }))
     }
     async fn count(&self, topic: &str, index: usize) {
@@ -304,6 +308,8 @@ impl Forwarder {
                 .begin(&key, &self.config, Utc::now())
         } {
             Claim::Duplicate => {
+                // Dropped as a duplicate: neither Pushover nor Grok Bot is called. The Grok
+                // Bot destination is discarded with the queue entry on acknowledge.
                 self.count(topic, 3).await;
                 return Delivery::Success;
             }
@@ -389,6 +395,27 @@ impl Forwarder {
         if self.queue.lock().await.destination(topic, GROK_BOT) != Some("pending") {
             return;
         }
+        let unsaved_key = format!("{topic}/{}", message.id);
+        // Bind first: the guard must be released before the body locks the map again.
+        let unsaved = self
+            .grok_bot_unsaved
+            .lock()
+            .await
+            .get(&unsaved_key)
+            .copied();
+        if let Some(outcome) = unsaved {
+            // A previous final outcome could not be persisted; retry the write, never the send.
+            if self
+                .queue
+                .lock()
+                .await
+                .mark(topic, GROK_BOT, outcome)
+                .is_ok()
+            {
+                self.grok_bot_unsaved.lock().await.remove(&unsaved_key);
+            }
+            return;
+        }
         let outcome = match self
             .grok_client
             .post(&self.config.grok_bot_webhook_url)
@@ -414,8 +441,19 @@ impl Forwarder {
                 tracing::warn!(topic, outcome, "Grok Bot delivery failed");
             }
         }
-        if outcome != "pending" {
-            let _ = self.queue.lock().await.mark(topic, GROK_BOT, outcome);
+        if outcome != "pending"
+            && let Err(error) = self.queue.lock().await.mark(topic, GROK_BOT, outcome)
+        {
+            tracing::warn!(
+                topic,
+                outcome,
+                %error,
+                "Failed to persist Grok Bot outcome; suppressing resend in memory"
+            );
+            self.grok_bot_unsaved
+                .lock()
+                .await
+                .insert(unsaved_key, outcome);
         }
     }
     async fn acknowledge(&self, topic: &str, id: &str) -> Result<()> {
@@ -802,6 +840,13 @@ mod tests {
             format!("http://{addr}")
         }
         async fn setup(pushover: u16, grok: u16) -> (Arc<Forwarder>, Arc<Fake>) {
+            setup_with_dedupe(pushover, grok, 0).await
+        }
+        async fn setup_with_dedupe(
+            pushover: u16,
+            grok: u16,
+            window: i64,
+        ) -> (Arc<Forwarder>, Arc<Fake>) {
             let fake = Arc::new(Fake::default());
             fake.pushover_status.store(pushover, Ordering::SeqCst);
             fake.grok_status.store(grok, Ordering::SeqCst);
@@ -812,7 +857,7 @@ mod tests {
                 pushover_user_key: "user".into(),
                 pushover_default_token: "app".into(),
                 topics: vec!["alerts".into()],
-                deduplication_window_seconds: 0,
+                deduplication_window_seconds: window,
                 max_retries: 1,
                 retry_delay_milliseconds: 1,
                 queue_store_path: std::env::temp_dir()
@@ -915,6 +960,51 @@ mod tests {
             app.queue.lock().await.accept("alerts", &m).unwrap();
             assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
             assert!(fake.grok_requests.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn dedupe_dropped_messages_skip_grok_bot() {
+            let (mut app, fake) = setup(200, 200).await;
+            Arc::get_mut(&mut app)
+                .unwrap()
+                .config
+                .deduplication_window_seconds = 300;
+            let first = alert("d1");
+            accept(&app, &first).await;
+            assert_eq!(app.deliver("alerts", &first).await, Delivery::Success);
+            app.queue.lock().await.acknowledge("alerts", "d1").unwrap();
+            // ntfy replays the same id (e.g. after reconnect): dropped by dedupe, so neither
+            // Pushover nor Grok Bot is called again.
+            let dup = alert("d1");
+            accept(&app, &dup).await;
+            assert_eq!(app.deliver("alerts", &dup).await, Delivery::Success);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("pending"));
+        }
+
+        #[tokio::test]
+        async fn unsaved_grok_outcome_is_not_resent() {
+            let (app, fake) = setup(200, 200).await;
+            let m = alert("u1");
+            accept(&app, &m).await;
+            app.grok_bot_unsaved
+                .lock()
+                .await
+                .insert("alerts/u1".into(), "delivered");
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert!(fake.grok_requests.lock().unwrap().is_empty());
+            assert_eq!(grok_state(&app).await.as_deref(), Some("delivered"));
+            assert!(app.grok_bot_unsaved.lock().await.is_empty());
+        }
+
+        #[test]
+        fn default_config_routes_nothing_to_grok_bot() {
+            let c = Config::default();
+            let none: &[String] = &[];
+            for p in [None, Some(1), Some(3), Some(5)] {
+                assert!(!c.routes_to_grok_bot("alerts", p, none));
+                assert!(!c.routes_to_grok_bot("", p, none));
+            }
         }
 
         #[test]

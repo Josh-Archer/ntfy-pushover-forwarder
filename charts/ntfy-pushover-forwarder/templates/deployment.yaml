@@ -66,6 +66,9 @@ spec:
             - name: Forwarder__DeduplicationStorePath
               value: {{ .Values.persistence.mountPath | default "/data" }}/dedupe.json
             {{- end }}
+            {{- if and .Values.grokBot.enabled (not .Values.existingSecret) }}
+            {{- fail "grokBot.enabled requires existingSecret (the Grok Bot webhook URL and key are read from it)" }}
+            {{- end }}
             {{- if .Values.existingSecret }}
             - name: Forwarder__NtfyToken
               valueFrom:
