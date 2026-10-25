@@ -119,7 +119,12 @@ impl Queue {
     pub fn cursor(&self, topic: &str) -> Option<&str> {
         self.state.cursors.get(topic).map(String::as_str)
     }
+    #[cfg(test)]
     pub fn accept(&mut self, topic: &str, message: &Message) -> Result<()> {
+        self.accept_to(topic, message, &[])
+    }
+    /// Accept with additional destinations, recorded atomically with the payload.
+    pub fn accept_to(&mut self, topic: &str, message: &Message, extra: &[&str]) -> Result<()> {
         ensure!(
             !self.state.pending.contains_key(topic),
             "Topic already has pending delivery"
@@ -139,7 +144,10 @@ impl Queue {
                 accepted_at: chrono::Utc::now().timestamp(),
                 attempts: 0,
                 next_attempt_at_ms: 0,
-                destinations: BTreeMap::from([("pushover".into(), "pending".into())]),
+                destinations: std::iter::once("pushover")
+                    .chain(extra.iter().copied())
+                    .map(|d| (d.into(), "pending".into()))
+                    .collect(),
             },
         );
         self.save(next)
@@ -163,6 +171,23 @@ impl Queue {
             .next_attempt_at_ms = chrono::Utc::now()
             .timestamp_millis()
             .saturating_add(delay.as_millis() as i64);
+        self.save(next)
+    }
+    pub fn destination(&self, topic: &str, name: &str) -> Option<&str> {
+        self.state
+            .pending
+            .get(topic)?
+            .destinations
+            .get(name)
+            .map(String::as_str)
+    }
+    pub fn mark(&mut self, topic: &str, name: &str, state: &str) -> Result<()> {
+        let mut next = self.state.clone();
+        next.pending
+            .get_mut(topic)
+            .context("No pending delivery")?
+            .destinations
+            .insert(name.into(), state.into());
         self.save(next)
     }
     pub fn failure(&mut self, topic: &str, reason: String) -> Result<()> {

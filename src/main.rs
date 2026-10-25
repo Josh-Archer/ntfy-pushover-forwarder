@@ -189,6 +189,25 @@ async fn metrics(
             );
         }
     }
+    if !app.config.grok_bot_webhook_url.is_empty() {
+        for (name, value) in [
+            ("grok_bot_deliveries_total", 0usize),
+            ("grok_bot_failures_total", 1),
+        ] {
+            let _ = writeln!(text, "# TYPE ntfy_forwarder_{name} counter");
+            for (topic, state) in topics.iter() {
+                let topic = topic
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                let count = [state.grok_bot_deliveries, state.grok_bot_failures][value];
+                let _ = writeln!(
+                    text,
+                    "ntfy_forwarder_{name}{{topic=\"{topic}\",destination=\"grokbot\"}} {count}"
+                );
+            }
+        }
+    }
     (
         [(
             header::CONTENT_TYPE,

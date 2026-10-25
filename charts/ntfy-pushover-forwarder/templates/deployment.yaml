@@ -91,6 +91,24 @@ spec:
                   key: {{ $key }}
                   optional: true
             {{- end }}
+            {{- if .Values.grokBot.enabled }}
+            - name: Forwarder__GrokBotWebhookUrl
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: {{ .Values.secretKeys.grokBotWebhookUrl }}
+            - name: Forwarder__GrokBotWebhookKey
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: {{ .Values.secretKeys.grokBotWebhookKey }}
+            - name: Forwarder__GrokBotMinimumPriority
+              value: {{ .Values.grokBot.minimumPriority | quote }}
+            {{- range $i, $topic := .Values.grokBot.topics }}
+            - name: Forwarder__GrokBotTopics__{{ $i }}
+              value: {{ $topic | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
           volumeMounts:
             - name: config
