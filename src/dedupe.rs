@@ -132,6 +132,15 @@ fn cursor_path(config: &Config) -> std::path::PathBuf {
 }
 
 pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with(path, data, |_| Ok(()))
+}
+
+/// `before_rename` is a test seam that runs after the temp file is durable and before it replaces `path`.
+fn atomic_write_with(
+    path: &Path,
+    data: &[u8],
+    before_rename: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -150,7 +159,29 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     file.write_all(data)?;
     file.sync_all()?;
     drop(file);
+    before_rename(&temp)?;
     fs::rename(&temp, path)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failure_before_rename_leaves_old_file_intact() {
+        let dir = std::env::temp_dir().join(format!("atomic-write-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("state.json");
+        atomic_write(&path, b"old").unwrap();
+        let result = atomic_write_with(&path, b"new", |temp| {
+            assert_eq!(fs::read(temp).unwrap(), b"new");
+            anyhow::bail!("injected crash before rename")
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        atomic_write(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
