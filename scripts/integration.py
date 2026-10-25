@@ -37,6 +37,7 @@ class FakeAPI:
         self.condition = threading.Condition()
         self.history = {}
         self.posts = []
+        self.post_times = []
         self.subscriptions = []
         self.downloads = []
         self.responses = []
@@ -141,11 +142,15 @@ class FakeAPI:
                         fields['filename'] = part.get_filename()
                         fields['mime'] = part.get_content_type()
                 with api.condition:
-                    code = api.responses.pop(0) if api.responses else 200
+                    response = api.responses.pop(0) if api.responses else 200
+                    code, headers = response if isinstance(response, tuple) else (response, {})
                     api.posts.append((fields, code))
+                    api.post_times.append(time.monotonic())
                     api.condition.notify_all()
                 data = json.dumps({'status': int(code == 200)}).encode()
                 self.send_response(code)
+                for name, value in headers.items():
+                    self.send_header(name, value)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
@@ -333,6 +338,36 @@ class Compatibility(unittest.TestCase):
         posts = self.posts(4)
         self.assertEqual([p['message'] for p in posts], ['first', 'first', 'first', 'second'])
         self.assertTrue(any(since == 'first' for _, since, _ in self.api.subscriptions))
+
+    def test_retry_after_survives_exhausted_attempts(self):
+        self.start(MaxRetries=1)
+        self.api.responses = [(429, {'Retry-After': '1'}), 200]
+        self.api.send(message='limited')
+        self.posts(2)
+        self.assertGreaterEqual(self.api.post_times[1] - self.api.post_times[0], 1.0)
+        self.assertEqual([p['message'] for p, _ in self.api.posts], ['limited', 'limited'])
+
+    def test_backoff_grows_and_invalid_header_falls_back(self):
+        self.start(MaxRetries=3, RetryDelayMilliseconds=100)
+        self.api.responses = [(503, {'Retry-After': 'invalid'}), 500, 200]
+        self.api.send()
+        self.posts(3)
+        self.assertGreaterEqual(self.api.post_times[1] - self.api.post_times[0], 0.1)
+        self.assertGreaterEqual(self.api.post_times[2] - self.api.post_times[1], 0.2)
+
+    def test_server_cooldown_keeps_other_topics_responsive_and_shutdown_prompt(self):
+        self.start(Topics=['alerts', 'other'])
+        self.api.responses = [(429, {'Retry-After': '3600'}), 200]
+        self.api.send(message='limited')
+        self.posts(1)
+        self.api.send('other', message='independent')
+        self.assertEqual(self.posts(2)[1]['message'], 'independent')
+        self.assertEqual(self.worker.health(), 'Healthy')
+        started = time.monotonic()
+        self.worker.process.terminate()
+        self.worker.process.wait(timeout=2)
+        self.assertEqual(self.worker.process.returncode, 0)
+        self.assertLess(time.monotonic() - started, 2)
 
     def test_permanent_failure_and_missing_id_do_not_block_following_messages(self):
         self.start()

@@ -9,6 +9,7 @@ anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+httpdate = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rand = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "multipart", "stream"] }

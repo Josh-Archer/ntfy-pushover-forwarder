@@ -820,6 +820,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
+ "httpdate",
  "rand 0.9.5",
  "reqwest",
  "serde",
