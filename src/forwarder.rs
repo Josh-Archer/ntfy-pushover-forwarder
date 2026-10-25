@@ -11,7 +11,6 @@ use reqwest::{
     Client, Url,
     multipart::{Form, Part},
 };
-use std::time::Instant;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tokio_util::{
@@ -37,7 +36,7 @@ pub struct TopicState {
     pub cursor: Option<String>,
     pub counters: [u64; 7],
     pub last_successful_delivery_timestamp_seconds: i64,
-    pub pending_since: Option<Instant>,
+    pub pending_since: Option<std::time::Instant>,
     pub delivery_attempts: u64,
     pub permanent_delivery_failures: u64,
     pub transient_delivery_failures: u64,
@@ -230,7 +229,7 @@ impl Forwarder {
             .get_mut(topic)
             .unwrap()
             .pending_since
-            .get_or_insert_with(Instant::now);
+            .get_or_insert_with(std::time::Instant::now);
         let key = message.fingerprint(topic);
         match self
             .store
