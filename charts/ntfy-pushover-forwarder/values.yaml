@@ -119,3 +119,14 @@ secretKeys:
     cluster-events: "pushover_api_token_cluster"
     backup-status: "pushover_api_token_backup"
     security-auth: "pushover_api_token_security"
+  # Grok Bot webhook routine URL and sender key (used only when grokBot.enabled)
+  grokBotWebhookUrl: "grokbot_webhook_url"
+  grokBotWebhookKey: "grokbot_webhook_key"
+
+# Optional: also send selected alerts to an existing Grok Bot webhook routine.
+# Requires existingSecret with the two grokBot* keys above.
+grokBot:
+  enabled: false
+  # Empty routes every configured topic
+  topics: []
+  minimumPriority: 4

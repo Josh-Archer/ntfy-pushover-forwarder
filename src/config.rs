@@ -29,6 +29,14 @@ pub struct Config {
     pub max_retries: usize,
     pub retry_delay_milliseconds: u64,
     pub reconnect_initial_delay_milliseconds: u64,
+    /// Grok Bot webhook routine URL; empty disables the Grok Bot destination.
+    pub grok_bot_webhook_url: String,
+    /// Grok Bot webhook sender key. Supply through a Secret, never appsettings.json.
+    pub grok_bot_webhook_key: String,
+    /// Topics routed to Grok Bot; empty routes every configured topic.
+    pub grok_bot_topics: Vec<String>,
+    /// Minimum ntfy priority (1-5, omitted = 3) routed to Grok Bot.
+    pub grok_bot_minimum_priority: i32,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -55,6 +63,10 @@ impl Default for Config {
             max_retries: 3,
             retry_delay_milliseconds: 0,
             reconnect_initial_delay_milliseconds: 1000,
+            grok_bot_webhook_url: String::new(),
+            grok_bot_webhook_key: String::new(),
+            grok_bot_topics: vec![],
+            grok_bot_minimum_priority: 4,
         }
     }
 }
@@ -146,6 +158,21 @@ impl Config {
             config.topics.iter().all(|t| !config.token(t).is_empty()),
             "A Pushover token is required for each topic"
         );
+        config.grok_bot_topics.retain(|t| !t.trim().is_empty());
+        if !config.grok_bot_webhook_url.is_empty() {
+            validate_url(&config.grok_bot_webhook_url).context("Invalid GrokBotWebhookUrl")?;
+            ensure!(
+                !config.grok_bot_webhook_key.is_empty(),
+                "GrokBotWebhookKey is required when GrokBotWebhookUrl is set"
+            );
+            ensure!(
+                config
+                    .grok_bot_topics
+                    .iter()
+                    .all(|t| config.topics.contains(t)),
+                "GrokBotTopics must be configured topics"
+            );
+        }
         config.deduplication_max_entries = config.deduplication_max_entries.max(1);
         config.max_retries = config.max_retries.max(1);
         if config.max_attachment_bytes < 0 {
@@ -155,6 +182,14 @@ impl Config {
             config.reconnect_initial_delay_milliseconds = 1000;
         }
         Ok(config)
+    }
+    /// Whether a message should also go to Grok Bot. Messages tagged `grokbot` are never
+    /// routed back, preventing loops when Grok Bot itself publishes to ntfy.
+    pub fn routes_to_grok_bot(&self, topic: &str, priority: Option<i32>, tags: &[String]) -> bool {
+        !self.grok_bot_webhook_url.is_empty()
+            && (self.grok_bot_topics.is_empty() || self.grok_bot_topics.iter().any(|t| t == topic))
+            && priority.unwrap_or(3) >= self.grok_bot_minimum_priority
+            && !tags.iter().any(|t| t.eq_ignore_ascii_case("grokbot"))
     }
     pub fn token(&self, topic: &str) -> &str {
         self.topic_tokens

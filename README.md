@@ -67,6 +67,10 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 | `QueueMaxBytes` | `67108864` (64 MiB); limits serialized pending, rejected, and cursor state |
 | `RetryDelayMilliseconds` | `0` selects a 1-second delivery backoff base; positive values retain their meaning as the base delay |
 | `ReconnectInitialDelayMilliseconds` | `1000`; capped at 60 seconds plus up to 20% jitter |
+| `GrokBotWebhookUrl` | Empty (disabled). Grok Bot webhook routine URL; supply from a Secret |
+| `GrokBotWebhookKey` | Required with the URL. Webhook sender key; supply from a Secret, never `appsettings.json` |
+| `GrokBotTopics` | Empty routes every topic; otherwise each entry must be a configured topic |
+| `GrokBotMinimumPriority` | `4`; omitted ntfy priorities are treated as `3` |
 
 `html` tags preserve markup. `markdown` or `md` tags HTML-escape the body and convert backtick spans to `<code>`. Formatting tags are case insensitive. Action buttons (`actions`) and `click` URLs map to Pushover `url` and `url_title` button fields, preferring the first `view` or `http` action with a URL (non-`view`/`http` actions such as `broadcast` are ignored). URLs are truncated to Pushover's 512-character limit, and button labels (`url_title`) are truncated to 100 characters. Images without an attachment use the first matching `LogoMap` tag, with `mag` as a fallback for topics containing `media`.
 
@@ -206,3 +210,13 @@ inspect and replay, explicitly delete selected failures, or increase storage and
 limit. `delete` is irreversible; export `queue list` to protected storage first when
 an audit copy is needed. Removing a topic from configuration leaves its work on disk;
 restore the topic to deliver/replay it.
+
+## Grok Bot destination (optional)
+
+Selected alerts can also be sent to an existing Grok Bot through a webhook routine, independently of Pushover. Create a webhook-triggered routine on the bot, copy its URL and sender key from the routine panel, and store both in the forwarder Secret (`grokbot_webhook_url`, `grokbot_webhook_key`; Helm: `grokBot.enabled: true`).
+
+- Each request is a `POST` of `application/json` with `Authorization: Bearer <key>` and `X-Automation-Key: <key>`, an 8-second timeout, and one attempt per delivery pass. HTTP 2xx means the routine woke.
+- The body is `{"kind":"ntfy_alert","untrusted":true,"topic","id","title","message","priority","tags"}`; title and message are truncated. The routine prompt must treat these fields as untrusted data and never as authorization for infrastructure changes.
+- A message is routed when Grok Bot is configured, its topic is in `GrokBotTopics` (or the list is empty), its priority is at least both `MinimumPriority` and `GrokBotMinimumPriority`, and it has no `grokbot` tag. Grok Bot should tag anything it publishes to ntfy with `grokbot` to prevent loops.
+- Grok Bot state is tracked as its own destination in the durable queue (`pending`, `delivered`, `failed`, `permanent`). Pushover is attempted first and is never blocked by Grok Bot. While Pushover is still retrying, a transient Grok Bot failure is retried with it; once Pushover finishes, a Grok Bot failure is final (`failed`) and counted in `ntfy_forwarder_grok_bot_failures_total`. A delivered destination is never resent, including on Pushover retries. 4xx responses other than 429 are permanent. Dead-letter replay resends only Pushover.
+- Unit tests use a protocol-faithful fake gateway only. Delivery to a real bot must be validated separately with the real routine URL and key: publish a test alert to a routed topic and confirm the routine wakes with the expected body.
