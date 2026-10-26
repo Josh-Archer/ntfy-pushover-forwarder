@@ -222,7 +222,7 @@ impl Forwarder {
             .await??
             .error_for_status()?;
         self.topics.lock().await.get_mut(topic).unwrap().connected = true;
-        if *outage && self.config.send_recovery_alerts {
+        if should_send_recovery(*outage, self.config.send_recovery_alerts) {
             self.recovery(topic).await;
         }
         *outage = false;
@@ -892,6 +892,11 @@ fn retry_delay(initial_ms: u64, attempt: u32, retry_after: Option<Duration>) -> 
     backoff(if initial_ms == 0 { 1000 } else { initial_ms }, attempt)
         .max(retry_after.unwrap_or_default())
 }
+/// A recovery alert is sent only after an outage and only when enabled.
+fn should_send_recovery(outage: bool, send_recovery_alerts: bool) -> bool {
+    outage && send_recovery_alerts
+}
+
 fn same_origin(a: &Url, b: &Url) -> bool {
     a.scheme() == b.scheme()
         && a.host_str() == b.host_str()
@@ -989,6 +994,14 @@ mod tests {
             Duration::from_secs(5)
         );
     }
+    #[test]
+    fn recovery_alert_requires_outage_and_enabled_setting() {
+        assert!(should_send_recovery(true, true));
+        assert!(!should_send_recovery(true, false));
+        assert!(!should_send_recovery(false, true));
+        assert!(!should_send_recovery(false, false));
+    }
+
     #[test]
     fn idempotency_header_is_the_message_id() {
         assert_eq!(
