@@ -37,6 +37,8 @@ pub struct Config {
     pub grok_bot_topics: Vec<String>,
     /// Minimum ntfy priority (1-5, omitted = 3) routed to Grok Bot.
     pub grok_bot_minimum_priority: i32,
+    /// Topics delivered to Grok Bot only; they are never sent to Pushover at any priority.
+    pub grok_bot_exclusive_topics: Vec<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -67,6 +69,7 @@ impl Default for Config {
             grok_bot_webhook_key: String::new(),
             grok_bot_topics: vec![],
             grok_bot_minimum_priority: 4,
+            grok_bot_exclusive_topics: vec![],
         }
     }
 }
@@ -159,6 +162,13 @@ impl Config {
             "A Pushover token is required for each topic"
         );
         config.grok_bot_topics.retain(|t| !t.trim().is_empty());
+        config
+            .grok_bot_exclusive_topics
+            .retain(|t| !t.trim().is_empty());
+        ensure!(
+            config.grok_bot_exclusive_topics.is_empty() || !config.grok_bot_webhook_url.is_empty(),
+            "GrokBotExclusiveTopics requires GrokBotWebhookUrl"
+        );
         if !config.grok_bot_webhook_url.is_empty() {
             validate_url(&config.grok_bot_webhook_url).context("Invalid GrokBotWebhookUrl")?;
             ensure!(
@@ -172,6 +182,13 @@ impl Config {
                     .all(|t| config.topics.contains(t)),
                 "GrokBotTopics must be configured topics"
             );
+            ensure!(
+                config
+                    .grok_bot_exclusive_topics
+                    .iter()
+                    .all(|t| config.topics.contains(t)),
+                "GrokBotExclusiveTopics must be configured topics"
+            );
         }
         config.deduplication_max_entries = config.deduplication_max_entries.max(1);
         config.max_retries = config.max_retries.max(1);
@@ -183,11 +200,24 @@ impl Config {
         }
         Ok(config)
     }
-    /// Whether a message should also go to Grok Bot. Messages tagged `grokbot` are never
-    /// routed back, preventing loops when Grok Bot itself publishes to ntfy.
+    /// Whether a topic is routed to Grok Bot only and never to Pushover.
+    pub fn is_grok_bot_exclusive(&self, topic: &str) -> bool {
+        self.grok_bot_exclusive_topics.iter().any(|t| t == topic)
+    }
+    /// Whether a message should go to Pushover: never for Grok Bot exclusive topics,
+    /// otherwise when its priority is at least `MinimumPriority`.
+    pub fn routes_to_pushover(&self, topic: &str, priority: Option<i32>) -> bool {
+        !self.is_grok_bot_exclusive(topic) && priority.unwrap_or(3) >= self.minimum_priority
+    }
+    /// Whether a message should go to Grok Bot. `GrokBotMinimumPriority` is applied
+    /// independently of `MinimumPriority`. Exclusive topics are always routed (subject to
+    /// priority). Messages tagged `grokbot` are never routed back, preventing loops when
+    /// Grok Bot itself publishes to ntfy.
     pub fn routes_to_grok_bot(&self, topic: &str, priority: Option<i32>, tags: &[String]) -> bool {
         !self.grok_bot_webhook_url.is_empty()
-            && (self.grok_bot_topics.is_empty() || self.grok_bot_topics.iter().any(|t| t == topic))
+            && (self.grok_bot_topics.is_empty()
+                || self.grok_bot_topics.iter().any(|t| t == topic)
+                || self.is_grok_bot_exclusive(topic))
             && priority.unwrap_or(3) >= self.grok_bot_minimum_priority
             && !tags.iter().any(|t| t.eq_ignore_ascii_case("grokbot"))
     }

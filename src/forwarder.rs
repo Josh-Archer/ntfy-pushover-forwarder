@@ -287,7 +287,12 @@ impl Forwarder {
             .await
             .pending(topic)
             .is_some_and(|e| e.replay);
-        if !replay && message.priority.unwrap_or(3) < self.config.minimum_priority {
+        // Dead-letter replay resends Pushover regardless of priority, but never for an
+        // exclusive topic. Grok Bot is filtered independently when the message is accepted.
+        let to_pushover = !self.config.is_grok_bot_exclusive(topic)
+            && (replay || self.config.routes_to_pushover(topic, message.priority));
+        let grok_pending = self.queue.lock().await.destination(topic, GROK_BOT) == Some("pending");
+        if !to_pushover && !grok_pending {
             self.count(topic, 2).await;
             return Delivery::Success;
         }
@@ -316,9 +321,21 @@ impl Forwarder {
             Claim::InProgress => return Delivery::Transient,
             Claim::Acquired => {}
         }
-        let image = self.image(topic, message).await;
-        let mut result = Delivery::Transient;
-        for _ in 0..self.config.max_retries {
+        let image = if to_pushover {
+            self.image(topic, message).await
+        } else {
+            None
+        };
+        let mut result = if to_pushover {
+            Delivery::Transient
+        } else {
+            Delivery::Success
+        };
+        for _ in 0..if to_pushover {
+            self.config.max_retries
+        } else {
+            0
+        } {
             let deadline = self
                 .queue
                 .lock()
@@ -799,11 +816,13 @@ mod tests {
         #[derive(Default)]
         struct Fake {
             pushover_status: AtomicU16,
+            pushover_requests: std::sync::atomic::AtomicUsize,
             grok_status: AtomicU16,
             grok_requests: std::sync::Mutex<Vec<(HeaderMap, serde_json::Value)>>,
         }
         async fn serve(fake: Arc<Fake>) -> String {
             async fn pushover(State(f): State<Arc<Fake>>) -> axum::http::StatusCode {
+                f.pushover_requests.fetch_add(1, Ordering::SeqCst);
                 axum::http::StatusCode::from_u16(f.pushover_status.load(Ordering::SeqCst)).unwrap()
             }
             // Mirrors the Grok Bot webhook routine contract: JSON POST, sender key in both
@@ -847,6 +866,14 @@ mod tests {
             grok: u16,
             window: i64,
         ) -> (Arc<Forwarder>, Arc<Fake>) {
+            setup_with(pushover, grok, window, |_| {}).await
+        }
+        async fn setup_with(
+            pushover: u16,
+            grok: u16,
+            window: i64,
+            tweak: impl FnOnce(&mut Config),
+        ) -> (Arc<Forwarder>, Arc<Fake>) {
             let fake = Arc::new(Fake::default());
             fake.pushover_status.store(pushover, Ordering::SeqCst);
             fake.grok_status.store(grok, Ordering::SeqCst);
@@ -868,6 +895,8 @@ mod tests {
                 grok_bot_webhook_key: "sender-key".into(),
                 ..Config::default()
             };
+            let mut config = config;
+            tweak(&mut config);
             (Forwarder::new(config).unwrap(), fake)
         }
         fn alert(id: &str) -> Message {
@@ -1092,6 +1121,160 @@ mod tests {
                 load(&[
                     ("Forwarder__GrokBotWebhookKey", "k"),
                     ("Forwarder__GrokBotWebhookUrl", "https://h.example/x?key=1"),
+                ])
+                .is_err()
+            );
+        }
+
+        /// Accepts like `consume` does: Grok Bot is a destination only when routed.
+        async fn accept_routed(app: &Forwarder, m: &Message) {
+            // Clear any previous message, as `consume` does after delivery. Bind first so
+            // the queue guard is released before acknowledge locks it again.
+            let prev = app
+                .queue
+                .lock()
+                .await
+                .pending("alerts")
+                .map(|e| e.message.id.clone());
+            if let Some(prev) = prev {
+                app.acknowledge("alerts", &prev).await.unwrap();
+            }
+            let routed = app
+                .config
+                .routes_to_grok_bot("alerts", m.priority, m.tags());
+            let extra: &[&str] = if routed { &[GROK_BOT] } else { &[] };
+            app.queue
+                .lock()
+                .await
+                .accept_to("alerts", m, extra)
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn exclusive_topic_at_priority_5_never_reaches_pushover() {
+            let (app, fake) = setup_with(200, 200, 0, |c| {
+                c.grok_bot_exclusive_topics = vec!["alerts".into()];
+                c.grok_bot_topics = vec![];
+            })
+            .await;
+            let m = alert("x1");
+            accept_routed(&app, &m).await;
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("delivered"));
+            // Below the bot minimum it goes nowhere, and still not to Pushover.
+            let mut low = alert("x2");
+            low.priority = Some(1);
+            accept_routed(&app, &low).await;
+            assert_eq!(app.deliver("alerts", &low).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn bot_minimum_is_independent_of_pushover_minimum() {
+            let (app, fake) = setup_with(200, 200, 0, |c| {
+                c.minimum_priority = 4;
+                c.grok_bot_minimum_priority = 1;
+            })
+            .await;
+            let mut m = alert("p1");
+            m.priority = Some(1);
+            accept_routed(&app, &m).await;
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            let m = alert("p5");
+            accept_routed(&app, &m).await;
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn non_exclusive_topics_still_reach_both() {
+            let (app, fake) = setup_with(200, 200, 0, |c| {
+                c.topics = vec!["alerts".into(), "bot".into()];
+                c.grok_bot_exclusive_topics = vec!["bot".into()];
+            })
+            .await;
+            let m = alert("n1");
+            accept_routed(&app, &m).await;
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            let mut low = alert("n2");
+            low.priority = Some(3);
+            accept_routed(&app, &low).await;
+            assert_eq!(app.deliver("alerts", &low).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 2);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn exclusive_routing_and_defaults() {
+            let d = Config::default();
+            assert!(d.grok_bot_exclusive_topics.is_empty());
+            assert_eq!(d.minimum_priority, 1);
+            assert_eq!(d.grok_bot_minimum_priority, 4);
+            assert!(d.routes_to_pushover("a", Some(1)));
+            let c = Config {
+                topics: vec!["a".into(), "b".into()],
+                grok_bot_webhook_url: "http://grok".into(),
+                grok_bot_topics: vec!["a".into()],
+                grok_bot_exclusive_topics: vec!["b".into()],
+                minimum_priority: 4,
+                grok_bot_minimum_priority: 1,
+                ..Config::default()
+            };
+            let none: &[String] = &[];
+            for p in [None, Some(1), Some(5)] {
+                assert!(!c.routes_to_pushover("b", p));
+            }
+            assert!(c.routes_to_grok_bot("b", Some(1), none));
+            assert!(c.routes_to_grok_bot("a", Some(1), none));
+            assert!(!c.routes_to_pushover("a", Some(3)));
+            assert!(c.routes_to_pushover("a", Some(4)));
+        }
+
+        #[test]
+        fn exclusive_topics_config_validation() {
+            let load = |extra: &[(&str, &str)]| {
+                let base = [
+                    ("Forwarder__NtfyUrl", "http://localhost"),
+                    ("Forwarder__PushoverUserKey", "user"),
+                    ("Forwarder__PushoverDefaultToken", "app"),
+                    ("Forwarder__Topics__0", "alerts"),
+                    ("Forwarder__Topics__1", "cluster-events"),
+                ];
+                Config::load(
+                    std::path::Path::new("/nonexistent"),
+                    base.iter()
+                        .chain(extra)
+                        .map(|(k, v)| (k.to_string(), v.to_string())),
+                )
+            };
+            assert!(load(&[]).unwrap().grok_bot_exclusive_topics.is_empty());
+            let bot = [
+                ("Forwarder__GrokBotWebhookUrl", "https://hooks.example/abc"),
+                ("Forwarder__GrokBotWebhookKey", "k"),
+            ];
+            let ok = load(&[
+                bot[0],
+                bot[1],
+                ("Forwarder__GrokBotExclusiveTopics__0", "cluster-events"),
+                ("Forwarder__GrokBotMinimumPriority", "1"),
+            ])
+            .unwrap();
+            assert_eq!(ok.grok_bot_exclusive_topics, ["cluster-events"]);
+            assert_eq!(ok.grok_bot_minimum_priority, 1);
+            assert!(load(&[("Forwarder__GrokBotExclusiveTopics__0", "cluster-events")]).is_err());
+            assert!(
+                load(&[
+                    bot[0],
+                    bot[1],
+                    ("Forwarder__GrokBotExclusiveTopics__0", "nope")
                 ])
                 .is_err()
             );

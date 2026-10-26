@@ -66,6 +66,9 @@ spec:
             - name: Forwarder__DeduplicationStorePath
               value: {{ .Values.persistence.mountPath | default "/data" }}/dedupe.json
             {{- end }}
+            {{- if and .Values.grokBot.exclusiveTopics (not .Values.grokBot.enabled) }}
+            {{- fail "grokBot.exclusiveTopics requires grokBot.enabled" }}
+            {{- end }}
             {{- if and .Values.grokBot.enabled (not .Values.existingSecret) }}
             {{- fail "grokBot.enabled requires existingSecret (the Grok Bot webhook URL and key are read from it)" }}
             {{- end }}
@@ -110,6 +113,10 @@ spec:
               value: {{ .Values.grokBot.minimumPriority | quote }}
             {{- range $i, $topic := .Values.grokBot.topics }}
             - name: Forwarder__GrokBotTopics__{{ $i }}
+              value: {{ $topic | quote }}
+            {{- end }}
+            {{- range $i, $topic := .Values.grokBot.exclusiveTopics }}
+            - name: Forwarder__GrokBotExclusiveTopics__{{ $i }}
               value: {{ $topic | quote }}
             {{- end }}
             {{- end }}
