@@ -129,4 +129,9 @@ grokBot:
   enabled: false
   # Empty routes every configured topic
   topics: []
+  # Minimum ntfy priority (1-5, omitted = 3) sent to Grok Bot. Applied independently of
+  # forwarder.minimumPriority (the Pushover minimum).
   minimumPriority: 4
+  # Topics sent to Grok Bot ONLY: never forwarded to Pushover at any priority. Each must be
+  # in forwarder.topics; they are routed to Grok Bot even when not listed in grokBot.topics.
+  exclusiveTopics: []
