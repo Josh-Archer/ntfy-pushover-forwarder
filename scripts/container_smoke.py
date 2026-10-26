@@ -23,9 +23,17 @@ try:
             NtfyUrl=api.url, Topics=['alerts'], PushoverUrl=api.url + '/pushover',
             PushoverUserKey='fake-user', PushoverDefaultToken='fake-token', HttpPort=port,
             DeduplicationStorePath='/data/dedupe.json', SendRecoveryAlerts=False)}))
+        # The Docker daemon may be remote (e.g. a DinD sidecar on the ARC runner), so a bind
+        # mount of a runner-local path would not exist there. Bake the config into a throwaway
+        # image instead; the build context is sent to the daemon over the API.
+        Path(directory, 'Dockerfile').write_text(
+            f'FROM {image}\nCOPY appsettings.json /app/appsettings.json\n')
+        smoke_image = f'{name}:latest'
+        subprocess.run(['docker', 'build', '-q', '-t', smoke_image, directory],
+                       check=True, stdout=subprocess.DEVNULL)
         subprocess.run(['docker', 'run', '-d', '--name', name, '--network', 'host',
                         '--read-only', '--cap-drop=ALL', '--tmpfs', '/data:uid=1654,gid=1654,mode=0700',
-                        '--mount', f'type=bind,src={config},dst=/app/appsettings.json,readonly', image],
+                        smoke_image],
                        check=True, stdout=subprocess.DEVNULL)
         try:
             def healthy():
@@ -46,5 +54,6 @@ try:
             print('Container passed forwarding, health, persistence, non-root identity and SIGTERM checks')
         finally:
             subprocess.run(['docker', 'rm', '-f', name], stdout=subprocess.DEVNULL)
+            subprocess.run(['docker', 'rmi', '-f', smoke_image], stdout=subprocess.DEVNULL)
 finally:
     api.close()
