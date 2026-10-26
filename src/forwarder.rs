@@ -1173,6 +1173,26 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn replayed_exclusive_topic_never_reaches_pushover() {
+            let (app, fake) = setup_with(200, 200, 0, |c| {
+                c.grok_bot_exclusive_topics = vec!["alerts".into()];
+                c.grok_bot_topics = vec![];
+            })
+            .await;
+            let m = alert("r1");
+            accept_routed(&app, &m).await;
+            let topics = vec!["alerts".to_string()];
+            {
+                let mut queue = app.queue.lock().await;
+                queue.reject("alerts", &m.id).unwrap();
+                let id = queue.failed()[0].queue_id.clone();
+                queue.replay(&id, &topics).unwrap();
+            }
+            app.deliver("alerts", &m).await;
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
         async fn bot_minimum_is_independent_of_pushover_minimum() {
             let (app, fake) = setup_with(200, 200, 0, |c| {
                 c.minimum_priority = 4;
