@@ -92,7 +92,13 @@ Existing `ntfy_forwarder_*_total{topic="..."}` counters retain their labels and 
 
 These metrics reset on restart. Pending age spans retries and reconnect waits, and includes image download time. Filtered messages, deduplicated messages, and recovery alerts do not update the successful-delivery timestamp. Invalid messages without IDs remain covered by the existing `forward_failures_total` counter. A transient error followed by success within the same batch increments attempts but not the exhausted-batch counter.
 
-`pending_messages` includes recovered durable work and excludes unread messages in ntfy. `dead_letter_messages` counts retained permanent failures. Only the Pushover destination is implemented.
+`pending_messages` includes recovered durable work and excludes unread messages in ntfy. `dead_letter_messages` counts retained permanent failures. When `GrokBotWebhookUrl` is set, webhook counters are also exported with `destination="grokbot"`:
+
+| Metric (prefixed `ntfy_forwarder_`) | Meaning |
+|---|---|
+| `grok_bot_deliveries_total` | Webhook responses in the 2xx range |
+| `grok_bot_retries_total` | Transient webhook failures (network error, HTTP 429, or 5xx) scheduled for another attempt |
+| `grok_bot_failures_total` | Permanent webhook rejections (HTTP 4xx other than 429) |
 
 Example Prometheus alert expressions (apply your normal alert duration):
 
@@ -201,9 +207,10 @@ Fix the destination configuration before replaying. Replay moves exactly one sel
 failure back to its topic's pending slot; drain that slot first. Restart the service
 to deliver it. The operation is atomic and uses the same single-writer lock. Replay
 bypasses dedupe and priority filtering, preserves successful destination states, and
-never rewinds the ingestion cursor. Only the failed Pushover destination is selected;
-Grok routing is not implemented. A failed replay returns to retained failures with
-updated metadata. A crash after downstream acceptance can still cause a duplicate.
+never rewinds the ingestion cursor. Only the failed Pushover destination is selected again.
+A webhook destination already marked delivered is not posted again. A failed replay returns
+to retained failures with updated metadata. A crash after downstream acceptance can still
+cause a duplicate. The webhook `Idempotency-Key` lets the receiver drop that duplicate.
 
 Retention is explicit: failures never expire or get evicted automatically. All retained
 failures share `QueueMaxBytes` with pending work and cursors. When full, intake pauses;
@@ -216,11 +223,11 @@ restore the topic to deliver/replay it.
 
 Selected alerts can also be sent to an existing Grok Bot through a webhook routine, independently of Pushover. Create a webhook-triggered routine on the bot, copy its URL and sender key from the routine panel, and store both in the forwarder Secret (`grokbot_webhook_url`, `grokbot_webhook_key`; Helm: `grokBot.enabled: true`).
 
-- Each request is a `POST` of `application/json` with `Authorization: Bearer <key>` and `X-Automation-Key: <key>`, an 8-second timeout, and one attempt per delivery pass. HTTP 2xx means the routine woke.
+- Each request is a `POST` of `application/json` with `Authorization: Bearer <key>`, `X-Automation-Key: <key>`, and `Idempotency-Key` set to the ntfy message id, with an 8-second timeout. HTTP 2xx means the routine woke. Receivers should treat that idempotency key as at-most-once for the alert so a replayed POST does not run the routine twice. Message ids that are not a single visible ASCII header value are sent without the header.
 - The body is `{"kind":"ntfy_alert","untrusted":true,"topic","id","title","message","priority","tags"}`; title and message are truncated. The routine prompt must treat these fields as untrusted data and never as authorization for infrastructure changes.
 - A message is routed when Grok Bot is configured, its topic is in `GrokBotTopics` or `GrokBotExclusiveTopics` (or `GrokBotTopics` is empty), its priority is at least `GrokBotMinimumPriority`, and it has no `grokbot` tag. `GrokBotMinimumPriority` is independent of `MinimumPriority`, which only gates Pushover: with `MinimumPriority: 4` and `GrokBotMinimumPriority: 1`, a priority-1 message goes to Grok Bot only. (Previously the bot also required `MinimumPriority`; with the defaults `1`/`4` behaviour is unchanged.)
 - Topics in `GrokBotExclusiveTopics` (Helm: `grokBot.exclusiveTopics`) are bot-only: they are never sent to Pushover at any priority, including dead-letter replay. Messages below `GrokBotMinimumPriority` on these topics are dropped and counted as filtered. Grok Bot should tag anything it publishes to ntfy with `grokbot` to prevent loops.
-- Grok Bot state is tracked as its own destination in the durable queue (`pending`, `delivered`, `failed`, `permanent`). Pushover is attempted first and is never blocked by Grok Bot. While Pushover is still retrying, a transient Grok Bot failure is retried with it; once Pushover finishes, a Grok Bot failure is final (`failed`) and counted in `ntfy_forwarder_grok_bot_failures_total`. A delivered destination is never resent, including on Pushover retries. 4xx responses other than 429 are permanent. Dead-letter replay resends only Pushover.
+- Grok Bot state is tracked as its own destination in the durable queue (`pending`, `delivered`, `permanent`). Pushover is attempted first. A successful Pushover post is marked delivered and is not sent again while the webhook retries, and a webhook failure does not turn that Pushover delivery into a failure. Transient webhook failures (network errors, HTTP 429, and 5xx) stay `pending` and use the same exponential backoff, 0–20% jitter, and `Retry-After` minimum as Pushover, with a separate attempt count and deadline. Each pass makes up to `MaxRetries` webhook attempts, then waits for the recorded deadline. HTTP 4xx other than 429 is `permanent` and is not retried. The topic keeps its one pending slot until every destination is terminal. A destination already marked delivered is never resent, including when a Pushover dead letter is replayed. `ntfy_forwarder_grok_bot_retries_total` counts transient failures scheduled for another attempt. `ntfy_forwarder_grok_bot_failures_total` counts permanent rejections.
 - Messages dropped by deduplication (same content within `DeduplicationWindowSeconds`) skip Grok Bot as well as Pushover; a duplicate is never sent to Grok Bot.
 - If the queue file cannot record a final Grok Bot outcome, a warning is logged and the outcome is kept in memory so the message is not resent; after a restart it may be sent once more.
 - Unit tests use a protocol-faithful fake gateway only. Delivery to a real bot must be validated separately with the real routine URL and key: publish a test alert to a routed topic and confirm the routine wakes with the expected body.

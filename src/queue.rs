@@ -32,6 +32,18 @@ pub struct Entry {
     #[serde(default)]
     pub next_attempt_at_ms: i64,
     pub destinations: BTreeMap<String, String>,
+    /// Per-destination attempt count and next deadline. Pushover keeps using
+    /// `attempts` / `next_attempt_at_ms` on the entry; webhook sinks use this map
+    /// so one destination's backoff cannot resend or delay the other.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub destination_retry: BTreeMap<String, DestinationRetry>,
+}
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct DestinationRetry {
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub next_attempt_at_ms: i64,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Snapshot {
@@ -158,6 +170,7 @@ impl Queue {
                     .chain(extra.iter().copied())
                     .map(|d| (d.into(), "pending".into()))
                     .collect(),
+                destination_retry: BTreeMap::new(),
             },
         );
         self.save(next)
@@ -200,6 +213,41 @@ impl Queue {
             .insert(name.into(), state.into());
         self.save(next)
     }
+    pub fn destination_retry(&self, topic: &str, name: &str) -> DestinationRetry {
+        self.state
+            .pending
+            .get(topic)
+            .and_then(|entry| entry.destination_retry.get(name))
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// Record one webhook attempt. The returned value is the attempt index before the increment.
+    pub fn note_destination_attempt(&mut self, topic: &str, name: &str) -> Result<u32> {
+        let mut next = self.state.clone();
+        let entry = next.pending.get_mut(topic).context("No pending delivery")?;
+        let slot = entry.destination_retry.entry(name.to_owned()).or_default();
+        let attempt = slot.attempts;
+        slot.attempts = slot.attempts.saturating_add(1);
+        self.save(next)?;
+        Ok(attempt)
+    }
+    pub fn defer_destination(
+        &mut self,
+        topic: &str,
+        name: &str,
+        delay: std::time::Duration,
+    ) -> Result<()> {
+        let mut next = self.state.clone();
+        let entry = next.pending.get_mut(topic).context("No pending delivery")?;
+        entry
+            .destination_retry
+            .entry(name.to_owned())
+            .or_default()
+            .next_attempt_at_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(delay.as_millis() as i64);
+        self.save(next)
+    }
     pub fn failure(&mut self, topic: &str, reason: String) -> Result<()> {
         let mut next = self.state.clone();
         next.pending
@@ -237,6 +285,9 @@ impl Queue {
         entry
             .destinations
             .insert("pushover".into(), "pending".into());
+        // Only Pushover is selected again. Delivered webhook acks stay delivered,
+        // so a replay cannot post a destination that already succeeded.
+        entry.destination_retry.remove("pushover");
         entry.replay = true;
         entry.next_attempt_at_ms = 0;
         next.pending.insert(entry.topic.clone(), entry);
@@ -385,6 +436,34 @@ mod tests {
         q.delete(&id).unwrap();
         drop(q);
         assert!(Queue::open(&cfg).unwrap().failed().is_empty());
+    }
+    #[test]
+    fn webhook_retry_deadline_survives_restart_and_replay_keeps_ack() {
+        let cfg = config();
+        let mut q = Queue::open(&cfg).unwrap();
+        let message = Message {
+            id: "m".into(),
+            ..Message::default()
+        };
+        q.accept_to("a", &message, &["grokbot"]).unwrap();
+        assert_eq!(q.note_destination_attempt("a", "grokbot").unwrap(), 0);
+        q.defer_destination("a", "grokbot", std::time::Duration::from_secs(90))
+            .unwrap();
+        drop(q);
+        let mut q = Queue::open(&cfg).unwrap();
+        let retry = q.destination_retry("a", "grokbot");
+        assert_eq!(retry.attempts, 1);
+        assert!(retry.next_attempt_at_ms > chrono::Utc::now().timestamp_millis());
+        q.mark("a", "grokbot", "delivered").unwrap();
+        q.failure("a", "HTTP 400".into()).unwrap();
+        q.reject("a", "m").unwrap();
+        let id = q.failed()[0].queue_id.clone();
+        q.replay(&id, &["a".into()]).unwrap();
+        let pending = q.pending("a").unwrap();
+        assert_eq!(pending.destinations["grokbot"], "delivered");
+        assert_eq!(pending.destinations["pushover"], "pending");
+        assert_eq!(q.destination_retry("a", "grokbot").attempts, 1);
+        assert!(!pending.destination_retry.contains_key("pushover"));
     }
     #[test]
     fn full_or_failed_storage_does_not_mutate_accepted_work() {
