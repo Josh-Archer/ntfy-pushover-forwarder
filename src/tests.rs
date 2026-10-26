@@ -575,3 +575,30 @@ async fn delivery_metrics_escape_labels_and_report_pending_age() {
         .unwrap();
     assert!(age >= 5.0);
 }
+
+#[tokio::test]
+async fn grok_bot_retry_and_failure_metrics_are_exported() {
+    let app = Forwarder::new(Config {
+        grok_bot_webhook_url: "http://127.0.0.1:9/grok".into(),
+        grok_bot_webhook_key: "sender".into(),
+        ..config()
+    })
+    .unwrap();
+    {
+        let mut topics = app.topics.lock().await;
+        let state = topics.get_mut("alerts").unwrap();
+        state.grok_bot_deliveries = 2;
+        state.grok_bot_failures = 3;
+        state.grok_bot_retries = 4;
+    }
+    let body = metrics(State(app)).await.1;
+    assert!(body.contains(
+        "ntfy_forwarder_grok_bot_deliveries_total{topic=\"alerts\",destination=\"grokbot\"} 2"
+    ));
+    assert!(body.contains(
+        "ntfy_forwarder_grok_bot_failures_total{topic=\"alerts\",destination=\"grokbot\"} 3"
+    ));
+    assert!(body.contains(
+        "ntfy_forwarder_grok_bot_retries_total{topic=\"alerts\",destination=\"grokbot\"} 4"
+    ));
+}

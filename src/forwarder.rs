@@ -30,6 +30,7 @@ pub const METRICS: [&str; 7] = [
 ];
 // ntfy messages are small JSON lines. Reject an unbounded line before allocating it all.
 pub(crate) const GROK_BOT: &str = "grokbot";
+pub(crate) const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const LOGO_CACHE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Default)]
@@ -44,6 +45,7 @@ pub struct TopicState {
     pub transient_delivery_failures: u64,
     pub grok_bot_deliveries: u64,
     pub grok_bot_failures: u64,
+    pub grok_bot_retries: u64,
 }
 #[derive(Clone)]
 struct Image {
@@ -70,6 +72,15 @@ enum Delivery {
     Success,
     Permanent,
     Transient,
+    /// Pushover is settled (or not targeted) and the webhook is waiting for backoff.
+    Deferred,
+}
+#[derive(Debug, PartialEq)]
+enum GrokOutcome {
+    Idle,
+    Delivered,
+    Permanent,
+    Pending,
 }
 impl Forwarder {
     pub fn new(config: Config) -> Result<Arc<Self>> {
@@ -137,6 +148,9 @@ impl Forwarder {
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
+                    // The next deliver() waits on the webhook deadline. Do not count a
+                    // Pushover failure or drop the subscription for that wait.
+                    Delivery::Deferred => continue,
                     Delivery::Success => {
                         if self.acknowledge(&topic, &message.id).await.is_err() {
                             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -247,19 +261,25 @@ impl Forwarder {
                 };
             self.queue.lock().await.accept_to(topic, &message, extra)?;
             *pending = Some(message.clone());
-            match self.deliver(topic, &message).await {
-                Delivery::Success => {
-                    self.acknowledge(topic, &message.id).await?;
-                    *pending = None;
-                }
-                Delivery::Permanent => {
-                    self.queue.lock().await.reject(topic, &message.id)?;
-                    self.sync_cursor(topic).await;
-                    *pending = None;
-                }
-                Delivery::Transient => {
-                    *pending = Some(message);
-                    bail!("Delivery failed");
+            loop {
+                match self.deliver(topic, &message).await {
+                    Delivery::Success => {
+                        self.acknowledge(topic, &message.id).await?;
+                        *pending = None;
+                        break;
+                    }
+                    Delivery::Permanent => {
+                        self.queue.lock().await.reject(topic, &message.id)?;
+                        self.sync_cursor(topic).await;
+                        *pending = None;
+                        break;
+                    }
+                    Delivery::Transient => {
+                        *pending = Some(message);
+                        bail!("Delivery failed");
+                    }
+                    // Webhook backoff is inside deliver(); keep the stream and this message.
+                    Delivery::Deferred => {}
                 }
             }
         }
@@ -287,10 +307,18 @@ impl Forwarder {
             .await
             .pending(topic)
             .is_some_and(|e| e.replay);
+        let pushover_state = self
+            .queue
+            .lock()
+            .await
+            .destination(topic, "pushover")
+            .map(str::to_owned);
         // Dead-letter replay resends Pushover regardless of priority, but never for an
-        // exclusive topic. Grok Bot is filtered independently when the message is accepted.
+        // exclusive topic, and never when that destination is already delivered or a
+        // recorded permanent rejection. Grok Bot is its own destination.
         let to_pushover = !self.config.is_grok_bot_exclusive(topic)
-            && (replay || self.config.routes_to_pushover(topic, message.priority));
+            && (replay || self.config.routes_to_pushover(topic, message.priority))
+            && !matches!(pushover_state.as_deref(), Some("delivered" | "permanent"));
         let grok_pending = self.queue.lock().await.destination(topic, GROK_BOT) == Some("pending");
         if !to_pushover && !grok_pending {
             self.count(topic, 2).await;
@@ -386,15 +414,50 @@ impl Forwarder {
                 break;
             }
         }
-        // Pushover is attempted first so an unavailable Grok Bot never delays it.
-        self.deliver_grok_bot(topic, message, result == Delivery::Transient)
-            .await;
-        Store::complete(&self.store, &key, result == Delivery::Success, &self.config).await;
-        self.count(topic, if result == Delivery::Success { 1 } else { 4 })
-            .await;
+        let pushover_mark = if to_pushover && result == Delivery::Success {
+            Some("delivered")
+        } else if to_pushover && result == Delivery::Permanent {
+            Some("permanent")
+        } else {
+            None
+        };
+        if let Some(state) = pushover_mark
+            && self
+                .queue
+                .lock()
+                .await
+                .mark(topic, "pushover", state)
+                .is_err()
+        {
+            // Cannot record the ack or rejection, so keep the destination pending and retry.
+            result = Delivery::Transient;
+        }
+        // Pushover is posted first. Webhook retries use their own deadline and never
+        // change the Pushover result or send it again once it is delivered or permanent.
+        let pushover_ok = to_pushover && result == Delivery::Success;
+        let grok = self.deliver_grok_bot(topic, message).await;
+        let pushover_status = self
+            .queue
+            .lock()
+            .await
+            .destination(topic, "pushover")
+            .map(str::to_owned);
+        let outcome = settle_delivery(to_pushover, result, grok, pushover_status.as_deref());
+        Store::complete(
+            &self.store,
+            &key,
+            outcome == Delivery::Success,
+            &self.config,
+        )
+        .await;
+        match outcome {
+            Delivery::Success => self.count(topic, 1).await,
+            Delivery::Permanent | Delivery::Transient => self.count(topic, 4).await,
+            Delivery::Deferred => {}
+        }
         let mut topics = self.topics.lock().await;
         let state = topics.get_mut(topic).unwrap();
-        match result {
+        match outcome {
             Delivery::Success => {
                 state.last_successful_delivery_timestamp_seconds = Utc::now().timestamp();
             }
@@ -402,15 +465,19 @@ impl Forwarder {
                 state.permanent_delivery_failures += 1;
             }
             Delivery::Transient => state.transient_delivery_failures += 1,
+            Delivery::Deferred if pushover_ok => {
+                state.last_successful_delivery_timestamp_seconds = Utc::now().timestamp();
+            }
+            Delivery::Deferred => {}
         }
-        result
+        outcome
     }
-    /// One webhook attempt per call. The outcome is persisted per destination, so Pushover
-    /// retries never resend to Grok Bot. While Pushover is still pending (`retry_later`), a
-    /// transient Grok Bot failure stays pending and is retried with it; otherwise it is final.
-    async fn deliver_grok_bot(&self, topic: &str, message: &Message, retry_later: bool) {
+    /// Webhook attempts for a still-pending Grok Bot destination. Transient failures stay
+    /// pending and are retried with exponential backoff and `Retry-After`. A delivered or
+    /// otherwise terminal destination is not posted again.
+    async fn deliver_grok_bot(&self, topic: &str, message: &Message) -> GrokOutcome {
         if self.queue.lock().await.destination(topic, GROK_BOT) != Some("pending") {
-            return;
+            return GrokOutcome::Idle;
         }
         let unsaved_key = format!("{topic}/{}", message.id);
         // Bind first: the guard must be released before the body locks the map again.
@@ -431,23 +498,65 @@ impl Forwarder {
             {
                 self.grok_bot_unsaved.lock().await.remove(&unsaved_key);
             }
-            return;
+            return if outcome == "delivered" {
+                GrokOutcome::Delivered
+            } else {
+                GrokOutcome::Permanent
+            };
         }
-        let outcome = match self
-            .grok_client
-            .post(&self.config.grok_bot_webhook_url)
-            .bearer_auth(&self.config.grok_bot_webhook_key)
-            .header("X-Automation-Key", &self.config.grok_bot_webhook_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(grok_bot_payload(topic, message).to_string())
-            .send()
+        let batch = self.config.max_retries.max(1);
+        for _ in 0..batch {
+            if self.queue.lock().await.destination(topic, GROK_BOT) != Some("pending") {
+                return GrokOutcome::Idle;
+            }
+            self.wait_for_destination(topic, GROK_BOT).await;
+            // A failed counter write must not block the send: the idempotency key and the
+            // in-memory unsaved outcome still suppress a duplicate once the POST succeeded.
+            let attempt = self
+                .queue
+                .lock()
+                .await
+                .note_destination_attempt(topic, GROK_BOT)
+                .unwrap_or(0);
+            match self.post_webhook(topic, message).await {
+                Ok((status, _)) if status.is_success() => {
+                    return self.record_grok_terminal(topic, message, "delivered").await;
+                }
+                Ok((status, _)) if status.is_client_error() && status.as_u16() != 429 => {
+                    return self.record_grok_terminal(topic, message, "permanent").await;
+                }
+                Ok((_, retry_after)) => {
+                    if !self.schedule_grok_retry(topic, attempt, retry_after).await {
+                        return GrokOutcome::Pending;
+                    }
+                }
+                Err(_) => {
+                    if !self.schedule_grok_retry(topic, attempt, None).await {
+                        return GrokOutcome::Pending;
+                    }
+                }
+            }
+        }
+        GrokOutcome::Pending
+    }
+    async fn wait_for_destination(&self, topic: &str, name: &str) {
+        let deadline = self
+            .queue
+            .lock()
             .await
-        {
-            Ok(r) if r.status().is_success() => "delivered",
-            Ok(r) if r.status().is_client_error() && r.status().as_u16() != 429 => "permanent",
-            _ if retry_later => "pending",
-            _ => "failed",
-        };
+            .destination_retry(topic, name)
+            .next_attempt_at_ms;
+        let remaining = deadline.saturating_sub(Utc::now().timestamp_millis());
+        if remaining > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining as u64)).await;
+        }
+    }
+    async fn record_grok_terminal(
+        &self,
+        topic: &str,
+        message: &Message,
+        outcome: &'static str,
+    ) -> GrokOutcome {
         {
             let mut topics = self.topics.lock().await;
             let state = topics.get_mut(topic).unwrap();
@@ -458,9 +567,8 @@ impl Forwarder {
                 tracing::warn!(topic, outcome, "Grok Bot delivery failed");
             }
         }
-        if outcome != "pending"
-            && let Err(error) = self.queue.lock().await.mark(topic, GROK_BOT, outcome)
-        {
+        let unsaved_key = format!("{topic}/{}", message.id);
+        if let Err(error) = self.queue.lock().await.mark(topic, GROK_BOT, outcome) {
             tracing::warn!(
                 topic,
                 outcome,
@@ -472,6 +580,77 @@ impl Forwarder {
                 .await
                 .insert(unsaved_key, outcome);
         }
+        if outcome == "delivered" {
+            GrokOutcome::Delivered
+        } else {
+            GrokOutcome::Permanent
+        }
+    }
+    /// Returns false when the deadline could not be stored. The caller stops this batch
+    /// so a disk error does not tight-loop POSTs.
+    async fn schedule_grok_retry(
+        &self,
+        topic: &str,
+        attempt: u32,
+        retry_after: Option<Duration>,
+    ) -> bool {
+        self.topics
+            .lock()
+            .await
+            .get_mut(topic)
+            .unwrap()
+            .grok_bot_retries += 1;
+        let delay = retry_delay(self.config.retry_delay_milliseconds, attempt, retry_after);
+        tracing::warn!(
+            topic,
+            attempt,
+            delay_ms = delay.as_millis() as u64,
+            "Grok Bot webhook will retry"
+        );
+        if self
+            .queue
+            .lock()
+            .await
+            .defer_destination(topic, GROK_BOT, delay)
+            .is_err()
+        {
+            tokio::time::sleep(delay).await;
+            return false;
+        }
+        true
+    }
+    async fn post_webhook(
+        &self,
+        topic: &str,
+        message: &Message,
+    ) -> reqwest::Result<(reqwest::StatusCode, Option<Duration>)> {
+        let mut request = self
+            .grok_client
+            .post(&self.config.grok_bot_webhook_url)
+            .bearer_auth(&self.config.grok_bot_webhook_key)
+            .header("X-Automation-Key", &self.config.grok_bot_webhook_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(key) = idempotency_header(&message.id) {
+            request = request.header(IDEMPOTENCY_HEADER, key);
+        }
+        let mut response = request
+            .body(grok_bot_payload(topic, message).to_string())
+            .send()
+            .await?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| parse_retry_after(v, std::time::SystemTime::now()));
+        let mut read = 0usize;
+        while let Ok(Some(chunk)) = response.chunk().await {
+            read += chunk.len();
+            if read > 65_536 {
+                break;
+            }
+        }
+        Ok((status, retry_after))
     }
     async fn acknowledge(&self, topic: &str, id: &str) -> Result<()> {
         self.queue.lock().await.acknowledge(topic, id)?;
@@ -725,6 +904,36 @@ fn backoff(initial_ms: u64, attempt: u32) -> Duration {
     Duration::from_millis(base + rand::random_range(0..=base / 5))
 }
 
+/// `Idempotency-Key` value: the ntfy message id when it is a single visible ASCII header token.
+fn idempotency_header(id: &str) -> Option<reqwest::header::HeaderValue> {
+    let id = id.trim();
+    if id.is_empty() || !id.bytes().all(|byte| (0x20..0x7f).contains(&byte)) {
+        return None;
+    }
+    reqwest::header::HeaderValue::from_str(id).ok()
+}
+
+/// Combine the Pushover batch result with webhook state.
+/// A pending webhook never hides a still-retrying Pushover attempt, and a stored
+/// permanent Pushover rejection stays permanent after the webhook finishes.
+fn settle_delivery(
+    to_pushover: bool,
+    pushover: Delivery,
+    grok: GrokOutcome,
+    pushover_status: Option<&str>,
+) -> Delivery {
+    if to_pushover && pushover == Delivery::Transient {
+        return Delivery::Transient;
+    }
+    if grok == GrokOutcome::Pending {
+        return Delivery::Deferred;
+    }
+    if pushover == Delivery::Permanent || pushover_status == Some("permanent") {
+        return Delivery::Permanent;
+    }
+    Delivery::Success
+}
+
 /// Webhook body for the Grok Bot routine. Alert text is external data: the routine prompt
 /// must treat it as untrusted and never as authorization for infrastructure changes.
 pub(crate) fn grok_bot_payload(topic: &str, message: &Message) -> serde_json::Value {
@@ -781,6 +990,84 @@ mod tests {
         );
     }
     #[test]
+    fn idempotency_header_is_the_message_id() {
+        assert_eq!(
+            idempotency_header("abc123").unwrap().to_str().unwrap(),
+            "abc123"
+        );
+        assert!(idempotency_header("bad\nid").is_none());
+        assert!(idempotency_header("  ").is_none());
+    }
+
+    #[test]
+    fn webhook_settle_retries_without_hiding_pushover_or_resending_acks() {
+        assert_eq!(
+            settle_delivery(
+                true,
+                Delivery::Transient,
+                GrokOutcome::Pending,
+                Some("pending")
+            ),
+            Delivery::Transient
+        );
+        assert_eq!(
+            settle_delivery(
+                true,
+                Delivery::Success,
+                GrokOutcome::Pending,
+                Some("delivered")
+            ),
+            Delivery::Deferred
+        );
+        assert_eq!(
+            settle_delivery(
+                false,
+                Delivery::Success,
+                GrokOutcome::Delivered,
+                Some("delivered")
+            ),
+            Delivery::Success
+        );
+        assert_eq!(
+            settle_delivery(
+                false,
+                Delivery::Success,
+                GrokOutcome::Idle,
+                Some("permanent")
+            ),
+            Delivery::Permanent
+        );
+        assert_eq!(
+            settle_delivery(
+                true,
+                Delivery::Permanent,
+                GrokOutcome::Delivered,
+                Some("permanent")
+            ),
+            Delivery::Permanent
+        );
+        assert_eq!(
+            settle_delivery(
+                false,
+                Delivery::Success,
+                GrokOutcome::Permanent,
+                Some("pending")
+            ),
+            Delivery::Success
+        );
+    }
+
+    #[test]
+    fn readme_documents_idempotency_header_and_webhook_metrics() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains(IDEMPOTENCY_HEADER));
+        assert!(readme.contains("ntfy message id"));
+        assert!(readme.contains("grok_bot_retries_total"));
+        assert!(readme.contains("grok_bot_failures_total"));
+        assert!(readme.contains("already marked delivered"));
+    }
+
+    #[test]
     fn backoff_is_bounded_and_jittered() {
         for attempt in 0..100 {
             let base = 1000u64.saturating_mul(1 << attempt.min(16)).min(60_000);
@@ -810,15 +1097,22 @@ mod tests {
 
     mod grok_bot {
         use super::*;
-        use axum::{Router, extract::State, http::HeaderMap, routing::post};
+        use axum::{
+            Router, extract::State, http::HeaderMap, response::IntoResponse, routing::post,
+        };
+        use std::collections::VecDeque;
         use std::sync::atomic::{AtomicU16, Ordering};
+        use std::time::Instant;
 
         #[derive(Default)]
         struct Fake {
             pushover_status: AtomicU16,
             pushover_requests: std::sync::atomic::AtomicUsize,
             grok_status: AtomicU16,
-            grok_requests: std::sync::Mutex<Vec<(HeaderMap, serde_json::Value)>>,
+            /// When non-empty, each request consumes the next status instead of `grok_status`.
+            grok_script: std::sync::Mutex<VecDeque<u16>>,
+            grok_retry_after: std::sync::Mutex<Option<String>>,
+            grok_requests: std::sync::Mutex<Vec<(HeaderMap, serde_json::Value, Instant)>>,
         }
         async fn serve(fake: Arc<Fake>) -> String {
             async fn pushover(State(f): State<Arc<Fake>>) -> axum::http::StatusCode {
@@ -831,7 +1125,7 @@ mod tests {
                 State(f): State<Arc<Fake>>,
                 headers: HeaderMap,
                 body: String,
-            ) -> axum::http::StatusCode {
+            ) -> axum::response::Response {
                 let authorized = headers.get("authorization").and_then(|v| v.to_str().ok())
                     == Some("Bearer sender-key")
                     && headers
@@ -841,13 +1135,32 @@ mod tests {
                     && headers.get("content-type").and_then(|v| v.to_str().ok())
                         == Some("application/json");
                 let Ok(json) = serde_json::from_str(&body) else {
-                    return axum::http::StatusCode::BAD_REQUEST;
+                    return axum::http::StatusCode::BAD_REQUEST.into_response();
                 };
-                f.grok_requests.lock().unwrap().push((headers, json));
+                f.grok_requests
+                    .lock()
+                    .unwrap()
+                    .push((headers, json, Instant::now()));
                 if !authorized {
-                    return axum::http::StatusCode::UNAUTHORIZED;
+                    return axum::http::StatusCode::UNAUTHORIZED.into_response();
                 }
-                axum::http::StatusCode::from_u16(f.grok_status.load(Ordering::SeqCst)).unwrap()
+                let code = {
+                    let mut script = f.grok_script.lock().unwrap();
+                    script
+                        .pop_front()
+                        .unwrap_or_else(|| f.grok_status.load(Ordering::SeqCst))
+                };
+                let status = axum::http::StatusCode::from_u16(code).unwrap();
+                let mut response = status.into_response();
+                if !status.is_success()
+                    && let Some(value) = f.grok_retry_after.lock().unwrap().clone()
+                {
+                    response.headers_mut().insert(
+                        "retry-after",
+                        value.parse().expect("retry-after is a valid header"),
+                    );
+                }
+                response
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -942,6 +1255,13 @@ mod tests {
             assert_eq!(body["topic"], "alerts");
             assert_eq!(body["id"], "m1");
             assert_eq!(body["priority"], 5);
+            assert_eq!(
+                requests[0]
+                    .0
+                    .get(IDEMPOTENCY_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("m1")
+            );
             assert_eq!(app.topics.lock().await["alerts"].grok_bot_deliveries, 1);
         }
 
@@ -950,10 +1270,139 @@ mod tests {
             let (app, fake) = setup(200, 503).await;
             let m = alert("m2");
             accept(&app, &m).await;
-            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
-            assert_eq!(grok_state(&app).await.as_deref(), Some("failed"));
+            // Pushover is acknowledged on the first pass. The webhook stays pending and
+            // is retried without posting Pushover again.
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Deferred);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("pending"));
+            assert_eq!(
+                app.queue.lock().await.destination("alerts", "pushover"),
+                Some("delivered")
+            );
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 1);
             assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
-            assert_eq!(app.topics.lock().await["alerts"].grok_bot_failures, 1);
+            assert_eq!(app.topics.lock().await["alerts"].grok_bot_retries, 1);
+            assert_eq!(app.topics.lock().await["alerts"].grok_bot_failures, 0);
+            fake.grok_status.store(200, Ordering::SeqCst);
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("delivered"));
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 2);
+            assert_eq!(app.topics.lock().await["alerts"].grok_bot_deliveries, 1);
+        }
+
+        #[tokio::test]
+        async fn webhook_retries_with_backoff_and_idempotency_key() {
+            let (app, fake) = setup_with(200, 503, 0, |config| {
+                config.max_retries = 3;
+                config.retry_delay_milliseconds = 30;
+            })
+            .await;
+            fake.grok_script.lock().unwrap().extend([503, 503, 200]);
+            let m = alert("retry-1");
+            accept(&app, &m).await;
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("delivered"));
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 1);
+            let requests = fake.grok_requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 3);
+            for request in &requests {
+                assert_eq!(
+                    request
+                        .0
+                        .get(IDEMPOTENCY_HEADER)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("retry-1")
+                );
+                assert_eq!(request.1["id"], "retry-1");
+            }
+            let first_gap = requests[1].2.saturating_duration_since(requests[0].2);
+            let second_gap = requests[2].2.saturating_duration_since(requests[1].2);
+            assert!(first_gap >= Duration::from_millis(25), "{first_gap:?}");
+            // Attempt 1 doubles the 30ms base. Allow a little timer slack.
+            assert!(second_gap >= Duration::from_millis(50), "{second_gap:?}");
+            let state = &app.topics.lock().await["alerts"];
+            assert_eq!(state.grok_bot_retries, 2);
+            assert_eq!(state.grok_bot_failures, 0);
+            assert_eq!(state.grok_bot_deliveries, 1);
+        }
+
+        #[tokio::test]
+        async fn webhook_retry_after_sets_the_destination_deadline() {
+            let (app, fake) = setup_with(200, 503, 0, |config| {
+                config.max_retries = 1;
+                config.retry_delay_milliseconds = 1;
+            })
+            .await;
+            *fake.grok_retry_after.lock().unwrap() = Some("2".into());
+            let m = alert("retry-after");
+            accept(&app, &m).await;
+            let before = Utc::now().timestamp_millis();
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Deferred);
+            let deadline = app
+                .queue
+                .lock()
+                .await
+                .destination_retry("alerts", GROK_BOT)
+                .next_attempt_at_ms;
+            assert!(deadline >= before + 1_900, "{deadline} vs {before}");
+            assert_eq!(app.topics.lock().await["alerts"].grok_bot_retries, 1);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 1);
+            // A later pass waits out that deadline and does not post Pushover again.
+            fake.grok_status.store(200, Ordering::SeqCst);
+            *fake.grok_retry_after.lock().unwrap() = None;
+            let started = Instant::now();
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert!(started.elapsed() >= Duration::from_millis(1_500));
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 2);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("delivered"));
+        }
+
+        #[tokio::test]
+        async fn replay_does_not_resend_acked_webhook() {
+            let (app, fake) = setup(400, 200).await;
+            let m = alert("ack-1");
+            accept(&app, &m).await;
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Permanent);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("delivered"));
+            assert_eq!(
+                fake.grok_requests.lock().unwrap()[0]
+                    .0
+                    .get(IDEMPOTENCY_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("ack-1")
+            );
+            {
+                let mut queue = app.queue.lock().await;
+                queue.reject("alerts", &m.id).unwrap();
+                let id = queue.failed()[0].queue_id.clone();
+                queue.replay(&id, &["alerts".into()]).unwrap();
+                assert_eq!(queue.destination("alerts", GROK_BOT), Some("delivered"));
+                assert_eq!(queue.destination("alerts", "pushover"), Some("pending"));
+            }
+            fake.pushover_status.store(200, Ordering::SeqCst);
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn exclusive_webhook_retries_without_calling_pushover() {
+            let (app, fake) = setup_with(200, 503, 0, |config| {
+                config.grok_bot_exclusive_topics = vec!["alerts".into()];
+                config.max_retries = 2;
+                config.retry_delay_milliseconds = 1;
+            })
+            .await;
+            fake.grok_script.lock().unwrap().extend([503, 200]);
+            let m = alert("ex-retry");
+            accept_routed(&app, &m).await;
+            assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 2);
+            assert_eq!(grok_state(&app).await.as_deref(), Some("delivered"));
+            assert_eq!(app.topics.lock().await["alerts"].grok_bot_retries, 1);
+            assert_eq!(app.topics.lock().await["alerts"].grok_bot_failures, 0);
         }
 
         #[tokio::test]
@@ -980,6 +1429,8 @@ mod tests {
             assert_eq!(app.deliver("alerts", &m).await, Delivery::Success);
             assert_eq!(grok_state(&app).await.as_deref(), Some("permanent"));
             assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+            assert_eq!(app.topics.lock().await["alerts"].grok_bot_failures, 1);
+            assert_eq!(app.topics.lock().await["alerts"].grok_bot_retries, 0);
         }
 
         #[tokio::test]
