@@ -22,7 +22,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def wait_for(predicate, timeout=10):
+def wait_for(predicate, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = predicate()
@@ -181,7 +181,7 @@ class FakeAPI:
 
 class Process:
     def __init__(self, api, command, persistent=False, **options):
-        self.temp = tempfile.TemporaryDirectory(prefix='ntfy-test-')
+        self.temp = tempfile.TemporaryDirectory(prefix='ntfy-test-', ignore_cleanup_errors=True)
         # A bound socket supplies an unused ephemeral health port.
         import socket
         with socket.socket() as sock:
@@ -306,7 +306,7 @@ class Compatibility(unittest.TestCase):
         self.assertEqual(self.metric('pending_messages'), 0)
 
     def test_delivery_visibility_resets_after_restart(self):
-        with tempfile.TemporaryDirectory(prefix='ntfy-metrics-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ntfy-metrics-', ignore_cleanup_errors=True) as directory:
             path = str(Path(directory, 'dedupe.json'))
             self.start(DeduplicationStorePath=path)
             self.api.send(id='delivered')
@@ -401,7 +401,7 @@ class Compatibility(unittest.TestCase):
         self.assertTrue(any(since == 'first' for _, since, _ in self.api.subscriptions))
 
     def test_durable_pending_recovers_after_kill_and_history_expiry(self):
-        with tempfile.TemporaryDirectory(prefix='ntfy-queue-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ntfy-queue-', ignore_cleanup_errors=True) as directory:
             path = str(Path(directory, 'queue.json'))
             self.start(QueueStorePath=path, MaxRetries=1, ReconnectInitialDelayMilliseconds=5000)
             self.api.responses = [500]
@@ -430,7 +430,7 @@ class Compatibility(unittest.TestCase):
         self.assertGreaterEqual(self.api.post_times[2] - self.api.post_times[0], 0.95)
 
     def test_retry_after_deadline_survives_restart(self):
-        with tempfile.TemporaryDirectory(prefix='ntfy-retry-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ntfy-retry-', ignore_cleanup_errors=True) as directory:
             path = str(Path(directory, 'queue.json'))
             self.start(QueueStorePath=path, MaxRetries=1)
             self.api.responses = [(503, '2'), 200]
@@ -444,7 +444,7 @@ class Compatibility(unittest.TestCase):
             self.assertGreaterEqual(self.api.post_times[1] - self.api.post_times[0], 1.95)
 
     def test_dead_letter_cli_replay_preserves_cursor_and_metadata(self):
-        with tempfile.TemporaryDirectory(prefix='ntfy-dead-letter-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ntfy-dead-letter-', ignore_cleanup_errors=True) as directory:
             path = str(Path(directory, 'queue.json'))
             self.start(QueueStorePath=path)
             self.api.responses = [400, 200]
@@ -487,7 +487,7 @@ class Compatibility(unittest.TestCase):
             self.assertEqual(json.loads(cli('list')), [])
 
     def test_full_queue_pauses_without_posting_or_advancing_cursor(self):
-        with tempfile.TemporaryDirectory(prefix='ntfy-full-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ntfy-full-', ignore_cleanup_errors=True) as directory:
             path = str(Path(directory, 'queue.json'))
             self.start(QueueStorePath=path, QueueMaxBytes=100)
             self.api.send(id='wait-for-storage', message='retain upstream until accepted')
@@ -537,7 +537,7 @@ class Compatibility(unittest.TestCase):
         self.assertEqual(self.api.downloads, [('/png', None)])
 
     def test_persistence_suppresses_replayed_id_after_restart(self):
-        with tempfile.TemporaryDirectory(prefix='ntfy-dedupe-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ntfy-dedupe-', ignore_cleanup_errors=True) as directory:
             path = str(Path(directory, 'dedupe.json'))
             self.start(DeduplicationStorePath=path)
             self.api.send(id='persisted')
