@@ -12,7 +12,7 @@ jobs:
 
   publish:
     needs: verify
-    runs-on: home-gh-runner
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     permissions:
       contents: read
       packages: write
