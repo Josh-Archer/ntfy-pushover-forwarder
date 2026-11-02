@@ -14,7 +14,7 @@ permissions:
 jobs:
   build-and-test:
     # Fork PRs never run on in-cluster ARC runners (home#4068).
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'home-gh-runner' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install C toolchain (ARC runner image has no cc)
