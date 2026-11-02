@@ -105,6 +105,10 @@ forwarder:
     mag: "https://raw.githubusercontent.com/Prowlarr/Prowlarr/develop/Logo/256.png"
     jellyseerr: "https://raw.githubusercontent.com/fallenbagel/jellyseerr/main/public/logo_full.png"
 
+  # Optional declarative per-topic multi-sink routes (Topics, MinimumPriority, Tags, Sinks).
+  # When empty, minimumPriority and grokBot.* synthesize the default routes.
+  routes: []
+
 # Existing secret containing all the tokens/keys
 existingSecret: "ntfy-secret"
 
