@@ -20,7 +20,7 @@ jobs:
 
   version:
     needs: verify
-    runs-on: home-gh-runner
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     outputs:
       new_version: ${{ steps.tag_action.outputs.new_tag }}
       has_new_tag: ${{ steps.tag_action.outputs.tag != '' }}
@@ -63,7 +63,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: home-gh-runner
+            runner: uecb-shared
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -91,7 +91,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: home-gh-runner
+            runner: uecb-shared
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -142,7 +142,7 @@ jobs:
           retention-days: 1
 
   publish-manifest:
-    runs-on: home-gh-runner
+    runs-on: uecb-shared
     needs: [version, publish-docker]
     if: needs.version.outputs.new_version != ''
     steps:
@@ -176,7 +176,7 @@ jobs:
           docker buildx imagetools inspect "${IMAGE}:${NEW_VERSION}"
 
   publish-helm:
-    runs-on: home-gh-runner
+    runs-on: uecb-shared
     needs: [version, publish-manifest]
     if: needs.version.outputs.new_version != ''
     steps:

@@ -202,8 +202,15 @@ class Process:
         self.log = tempfile.TemporaryFile()
         self.process = subprocess.Popen(command, cwd=self.temp.name, env=env, stdout=self.log, stderr=self.log)
         self.api = api
+        with api.condition:
+            seen = len(api.subscriptions)
+        topics = set(self.config['Topics'])
         try:
             wait_for(lambda: self.health() == 'Healthy')
+            # Health can report ready before the ntfy streams are open. The fake API
+            # (like ntfy without `since`) only streams messages published after the
+            # subscription, so wait for every topic to subscribe before tests publish.
+            wait_for(lambda: topics <= {t for t, _, _ in api.subscriptions[seen:]})
         except Exception:
             self.log.seek(0)
             print(self.log.read().decode())
