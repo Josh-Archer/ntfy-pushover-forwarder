@@ -15,7 +15,7 @@ jobs:
 
   version:
     needs: verify
-    runs-on: home-gh-runner
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     outputs:
       new_version: ${{ steps.tag_action.outputs.new_tag }}
       has_new_tag: ${{ steps.tag_action.outputs.tag != '' }}
@@ -46,7 +46,7 @@ jobs:
           file_pattern: 'charts/ntfy-pushover-forwarder/Chart.yaml'
 
   publish-docker:
-    runs-on: home-gh-runner
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     needs: version
     # If no new version was calculated, we can still build but it's better to only release on changes
     if: needs.version.outputs.new_version != ''
@@ -89,7 +89,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   publish-helm:
-    runs-on: home-gh-runner
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     needs: [version, publish-docker]
     if: needs.version.outputs.new_version != ''
     steps:
