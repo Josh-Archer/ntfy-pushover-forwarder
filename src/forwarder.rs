@@ -317,7 +317,12 @@ impl Forwarder {
         // exclusive topic, and never when that destination is already delivered or a
         // recorded permanent rejection. Grok Bot is its own destination.
         let to_pushover = !self.config.is_grok_bot_exclusive(topic)
-            && (replay || self.config.routes_to_pushover(topic, message.priority))
+            && (replay
+                || self.config.routes_to_pushover_with_tags(
+                    topic,
+                    message.priority,
+                    message.tags(),
+                ))
             && !matches!(pushover_state.as_deref(), Some("delivered" | "permanent"));
         let grok_pending = self.queue.lock().await.destination(topic, GROK_BOT) == Some("pending");
         if !to_pushover && !grok_pending {
@@ -1762,6 +1767,303 @@ mod tests {
                 ])
                 .is_err()
             );
+        }
+
+        #[test]
+        fn legacy_settings_map_to_default_routes_for_back_compat() {
+            use crate::config::{Route, SINK_GROK_BOT, SINK_PUSHOVER};
+            let base = Config {
+                topics: vec!["alerts".into(), "cluster".into(), "media".into()],
+                minimum_priority: 3,
+                ..Config::default()
+            };
+            assert_eq!(
+                base.effective_routes(),
+                vec![Route {
+                    topics: vec![],
+                    minimum_priority: 3,
+                    tags: vec![],
+                    sinks: vec![SINK_PUSHOVER.into()],
+                }]
+            );
+            let with_bot = Config {
+                grok_bot_webhook_url: "https://hooks.example/grok".into(),
+                grok_bot_webhook_key: "secret".into(),
+                grok_bot_topics: vec!["alerts".into()],
+                grok_bot_exclusive_topics: vec!["cluster".into()],
+                grok_bot_minimum_priority: 2,
+                ..base
+            };
+            assert_eq!(
+                with_bot.effective_routes(),
+                vec![
+                    Route {
+                        topics: vec!["alerts".into(), "media".into()],
+                        minimum_priority: 3,
+                        tags: vec![],
+                        sinks: vec![SINK_PUSHOVER.into()],
+                    },
+                    Route {
+                        topics: vec!["alerts".into(), "cluster".into()],
+                        minimum_priority: 2,
+                        tags: vec!["!grokbot".into()],
+                        sinks: vec![SINK_GROK_BOT.into()],
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn declarative_routes_precedence_tags_and_sinks() {
+            use crate::config::{Route, SINK_GROK_BOT, SINK_PUSHOVER};
+            let cfg = Config {
+                topics: vec!["alerts".into(), "cluster".into(), "media".into()],
+                grok_bot_webhook_url: "https://hooks.example/grok".into(),
+                grok_bot_webhook_key: "secret".into(),
+                routes: vec![
+                    // Explicit drop rule for muted alerts on `alerts`
+                    Route {
+                        topics: vec!["alerts".into()],
+                        minimum_priority: 1,
+                        tags: vec!["muted".into()],
+                        sinks: vec![],
+                    },
+                    // High-priority siren alerts on `alerts` go to both Pushover and Grok Bot
+                    Route {
+                        topics: vec!["alerts".into()],
+                        minimum_priority: 4,
+                        tags: vec!["siren".into()],
+                        sinks: vec!["pushover".into(), "grokbot".into()],
+                    },
+                    // Normal alerts on `alerts` (priority >= 3, not noisy) go to Pushover
+                    Route {
+                        topics: vec!["alerts".into()],
+                        minimum_priority: 3,
+                        tags: vec!["!noisy".into()],
+                        sinks: vec!["pushover".into()],
+                    },
+                    // `cluster` is webhook-only at priority >= 2 (overrides catch-all `*`)
+                    Route {
+                        topics: vec!["cluster".into()],
+                        minimum_priority: 2,
+                        tags: vec![],
+                        sinks: vec!["webhook".into()],
+                    },
+                    // Catch-all default for remaining topics (`media`) at priority >= 2
+                    Route {
+                        topics: vec!["*".into()],
+                        minimum_priority: 2,
+                        tags: vec![],
+                        sinks: vec!["pushover".into()],
+                    },
+                ],
+                ..Config::default()
+            };
+
+            // 1. Topic-specific route overrides catch-all `*`: `cluster` only goes to grokbot, never pushover
+            assert!(cfg.is_grok_bot_exclusive("cluster"));
+            assert!(!cfg.is_grok_bot_exclusive("alerts"));
+            assert!(!cfg.is_grok_bot_exclusive("media"));
+            assert_eq!(
+                cfg.route_sinks("cluster", Some(5), &[]),
+                std::collections::BTreeSet::from([SINK_GROK_BOT])
+            );
+            assert!(cfg.route_sinks("cluster", Some(1), &[]).is_empty());
+
+            // 2. Catch-all route applies to `media` (which has no explicit topic route)
+            assert_eq!(
+                cfg.route_sinks("media", Some(2), &[]),
+                std::collections::BTreeSet::from([SINK_PUSHOVER])
+            );
+            assert!(cfg.route_sinks("media", Some(1), &[]).is_empty());
+
+            // 3. Tag + priority union on `alerts`: priority 4 with `siren` matches both `alerts` routes
+            assert_eq!(
+                cfg.route_sinks("alerts", Some(4), &["SIREN".into()]),
+                std::collections::BTreeSet::from([SINK_PUSHOVER, SINK_GROK_BOT])
+            );
+            // Priority 3 with `siren` only satisfies the second `alerts` route (min_priority 3)
+            assert_eq!(
+                cfg.route_sinks("alerts", Some(3), &["siren".into()]),
+                std::collections::BTreeSet::from([SINK_PUSHOVER])
+            );
+            // Priority 2 on `alerts` does NOT fall back to the `*` (min_priority 2) catch-all route
+            assert!(cfg.route_sinks("alerts", Some(2), &[]).is_empty());
+
+            // 4. Negative tag `!noisy` blocks the general `alerts` route, but `siren` at priority 4 still routes
+            assert!(
+                cfg.route_sinks("alerts", Some(3), &["noisy".into()])
+                    .is_empty()
+            );
+            assert_eq!(
+                cfg.route_sinks("alerts", Some(4), &["siren".into(), "noisy".into()]),
+                std::collections::BTreeSet::from([SINK_PUSHOVER, SINK_GROK_BOT])
+            );
+
+            // 5. Empty-sink drop route (`muted`) takes precedence and suppresses delivery
+            assert!(
+                cfg.route_sinks("alerts", Some(5), &["muted".into(), "siren".into()])
+                    .is_empty()
+            );
+
+            // 6. Loop prevention: `grokbot` tag always suppresses `grokbot` sink even when not in route `Tags`
+            assert_eq!(
+                cfg.route_sinks("alerts", Some(5), &["siren".into(), "grokbot".into()]),
+                std::collections::BTreeSet::from([SINK_PUSHOVER])
+            );
+            assert!(
+                cfg.route_sinks("cluster", Some(5), &["grokbot".into()])
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn routes_load_from_json_and_env_with_validation() {
+            let dir = std::env::temp_dir()
+                .join(format!("ntfy-routes-config-{}.json", rand::random::<u64>()));
+            std::fs::write(
+                &dir,
+                r#"{
+                    "Forwarder": {
+                        "NtfyUrl": "http://localhost",
+                        "PushoverUserKey": "user",
+                        "PushoverDefaultToken": "app",
+                        "Topics": ["alerts", "cluster", "media"],
+                        "GrokBotWebhookUrl": "https://hooks.example/abc",
+                        "GrokBotWebhookKey": "secret",
+                        "Routes": [
+                            {
+                                "Topic": "alerts",
+                                "MinPriority": 4,
+                                "Tags": ["critical", "!silenced"],
+                                "Destinations": ["pushover", "webhook"]
+                            },
+                            {
+                                "Topics": ["*"],
+                                "MinimumPriority": 2,
+                                "Sinks": "pushover"
+                            }
+                        ]
+                    }
+                }"#,
+            )
+            .unwrap();
+            let env = [
+                ("Forwarder__Routes__1__MinimumPriority", "3"),
+                ("Forwarder__Routes__2__Topics__0", "cluster"),
+                ("Forwarder__Routes__2__Sinks", "grokbot"),
+            ];
+            let cfg =
+                Config::load(&dir, env.into_iter().map(|(k, v)| (k.into(), v.into()))).unwrap();
+            std::fs::remove_file(&dir).unwrap();
+            assert_eq!(cfg.routes.len(), 3);
+            assert_eq!(cfg.routes[0].topics, ["alerts"]);
+            assert_eq!(cfg.routes[0].minimum_priority, 4);
+            assert_eq!(cfg.routes[0].tags, ["critical", "!silenced"]);
+            assert_eq!(cfg.routes[0].sinks, ["pushover", "grokbot"]);
+            assert_eq!(cfg.routes[1].minimum_priority, 3);
+            assert_eq!(cfg.routes[2].topics, ["cluster"]);
+            assert_eq!(cfg.routes[2].sinks, ["grokbot"]);
+
+            // Unknown sink fails validation
+            let bad_sink = [
+                ("Forwarder__NtfyUrl", "http://localhost"),
+                ("Forwarder__PushoverUserKey", "user"),
+                ("Forwarder__PushoverDefaultToken", "app"),
+                ("Forwarder__Topics__0", "alerts"),
+                ("Forwarder__Routes__0__Sinks__0", "slack"),
+            ];
+            assert!(
+                Config::load(
+                    std::path::Path::new("/nonexistent"),
+                    bad_sink.into_iter().map(|(k, v)| (k.into(), v.into()))
+                )
+                .is_err()
+            );
+
+            // Unconfigured topic in route fails validation
+            let bad_topic = [
+                ("Forwarder__NtfyUrl", "http://localhost"),
+                ("Forwarder__PushoverUserKey", "user"),
+                ("Forwarder__PushoverDefaultToken", "app"),
+                ("Forwarder__Topics__0", "alerts"),
+                ("Forwarder__Routes__0__Topics__0", "unknown"),
+                ("Forwarder__Routes__0__Sinks__0", "pushover"),
+            ];
+            assert!(
+                Config::load(
+                    std::path::Path::new("/nonexistent"),
+                    bad_topic.into_iter().map(|(k, v)| (k.into(), v.into()))
+                )
+                .is_err()
+            );
+
+            // Webhook/grokbot sink without GrokBotWebhookUrl fails validation
+            let missing_webhook_url = [
+                ("Forwarder__NtfyUrl", "http://localhost"),
+                ("Forwarder__PushoverUserKey", "user"),
+                ("Forwarder__PushoverDefaultToken", "app"),
+                ("Forwarder__Topics__0", "alerts"),
+                ("Forwarder__Routes__0__Sinks__0", "webhook"),
+            ];
+            assert!(
+                Config::load(
+                    std::path::Path::new("/nonexistent"),
+                    missing_webhook_url
+                        .into_iter()
+                        .map(|(k, v)| (k.into(), v.into()))
+                )
+                .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn declarative_routes_deliver_per_tag_and_sink() {
+            use crate::config::Route;
+            let (app, fake) = setup_with(200, 200, 0, |c| {
+                c.routes = vec![
+                    Route {
+                        topics: vec!["alerts".into()],
+                        minimum_priority: 4,
+                        tags: vec!["bot".into()],
+                        sinks: vec!["webhook".into()],
+                    },
+                    Route {
+                        topics: vec!["alerts".into()],
+                        minimum_priority: 3,
+                        tags: vec!["page".into()],
+                        sinks: vec!["pushover".into()],
+                    },
+                ];
+            })
+            .await;
+
+            // Tag `bot` at priority 4 -> Grok Bot only
+            let mut m1 = alert("r-bot");
+            m1.priority = Some(4);
+            m1.tags = Some(vec!["bot".into()]);
+            accept_routed(&app, &m1).await;
+            assert_eq!(app.deliver("alerts", &m1).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+
+            // Tag `page` at priority 3 -> Pushover only
+            let mut m2 = alert("r-page");
+            m2.priority = Some(3);
+            m2.tags = Some(vec!["page".into()]);
+            accept_routed(&app, &m2).await;
+            assert_eq!(app.deliver("alerts", &m2).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 1);
+
+            // Both `bot` and `page` at priority 5 -> both sinks
+            let mut m3 = alert("r-both");
+            m3.priority = Some(5);
+            m3.tags = Some(vec!["bot".into(), "page".into()]);
+            accept_routed(&app, &m3).await;
+            assert_eq!(app.deliver("alerts", &m3).await, Delivery::Success);
+            assert_eq!(fake.pushover_requests.load(Ordering::SeqCst), 2);
+            assert_eq!(fake.grok_requests.lock().unwrap().len(), 2);
         }
     }
 }

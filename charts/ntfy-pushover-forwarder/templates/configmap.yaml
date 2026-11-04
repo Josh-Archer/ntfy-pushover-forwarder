@@ -15,6 +15,9 @@ data:
         "SendRecoveryAlerts": {{ .Values.forwarder.sendRecoveryAlerts | toJson }},
         "HttpPort": {{ .Values.service.port | default 8080 }},
         "Topics": {{ toJson .Values.forwarder.topics }},
+        {{- if .Values.forwarder.routes }}
+        "Routes": {{ toJson .Values.forwarder.routes }},
+        {{- end }}
         "SoundMap": {{ toJson .Values.forwarder.soundMap }},
         "LogoMap": {{ toJson .Values.forwarder.logoMap }}
       }

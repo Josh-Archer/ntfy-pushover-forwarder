@@ -1,7 +1,89 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+};
+
+pub const SINK_PUSHOVER: &str = "pushover";
+pub const SINK_GROK_BOT: &str = "grokbot";
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct Route {
+    /// Topics matched by this route. Empty or `["*"]` matches every configured topic.
+    #[serde(alias = "Topic", deserialize_with = "deserialize_string_or_vec")]
+    pub topics: Vec<String>,
+    /// Minimum ntfy priority (1-5; omitted ntfy message priority is 3). Defaults to 1.
+    #[serde(
+        default = "default_route_priority",
+        alias = "MinPriority",
+        alias = "min_priority",
+        alias = "minimum_priority"
+    )]
+    pub minimum_priority: i32,
+    /// Optional required tags (case-insensitive; `!tag` excludes messages carrying `tag`).
+    /// When multiple positive tags are listed, all must be present on the message.
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    pub tags: Vec<String>,
+    /// Destination sinks for matching messages (`pushover`, `webhook`, `grokbot`).
+    /// An empty list drops matching messages without forwarding to later routes.
+    #[serde(alias = "Destinations", deserialize_with = "deserialize_string_or_vec")]
+    pub sinks: Vec<String>,
+}
+
+fn default_route_priority() -> i32 {
+    1
+}
+
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match Option::<OneOrMany>::deserialize(deserializer)? {
+        None => Ok(vec![]),
+        Some(OneOrMany::One(s)) => Ok(if s.trim().is_empty() { vec![] } else { vec![s] }),
+        Some(OneOrMany::Many(v)) => Ok(v),
+    }
+}
+
+pub fn normalize_sink(name: &str) -> Result<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "pushover" => Ok(SINK_PUSHOVER),
+        "grokbot" | "grok_bot" | "grok-bot" | "webhook" => Ok(SINK_GROK_BOT),
+        other => bail!("Unknown route sink '{other}'; expected pushover, webhook, or grokbot"),
+    }
+}
+
+impl Route {
+    pub fn matches(&self, topic: &str, priority: Option<i32>, tags: &[String]) -> bool {
+        let topic_ok = self.topics.is_empty() || self.topics.iter().any(|t| t == "*" || t == topic);
+        if !topic_ok || priority.unwrap_or(3) < self.minimum_priority {
+            return false;
+        }
+        for filter in &self.tags {
+            let filter = filter.trim();
+            if filter.is_empty() {
+                continue;
+            }
+            if let Some(excluded) = filter.strip_prefix('!') {
+                if tags.iter().any(|t| t.eq_ignore_ascii_case(excluded.trim())) {
+                    return false;
+                }
+            } else if !tags.iter().any(|t| t.eq_ignore_ascii_case(filter)) {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, rename_all = "PascalCase")]
@@ -39,6 +121,9 @@ pub struct Config {
     pub grok_bot_minimum_priority: i32,
     /// Topics delivered to Grok Bot only; they are never sent to Pushover at any priority.
     pub grok_bot_exclusive_topics: Vec<String>,
+    /// Declarative per-topic multi-sink routes evaluated in order (first topic match wins).
+    /// When empty, existing settings (`MinimumPriority`, `GrokBot*`) map to default routes.
+    pub routes: Vec<Route>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -70,6 +155,7 @@ impl Default for Config {
             grok_bot_topics: vec![],
             grok_bot_minimum_priority: 4,
             grok_bot_exclusive_topics: vec![],
+            routes: vec![],
         }
     }
 }
@@ -125,6 +211,8 @@ impl Config {
                 } else {
                     serde_json::from_str(&val).with_context(|| format!("Invalid {name}"))?
                 };
+            } else if name == "Routes" {
+                apply_route_env(slot, &parts[2..], val)?;
             } else if let Some(array) = slot.as_array_mut() {
                 let index: usize = parts[2].parse().context("Invalid Topics index")?;
                 ensure!(index < 1024, "Topics index exceeds 1023");
@@ -169,6 +257,41 @@ impl Config {
             config.grok_bot_exclusive_topics.is_empty() || !config.grok_bot_webhook_url.is_empty(),
             "GrokBotExclusiveTopics requires GrokBotWebhookUrl"
         );
+        for route in &mut config.routes {
+            route.topics.retain(|t| !t.trim().is_empty());
+            ensure!(
+                route
+                    .topics
+                    .iter()
+                    .all(|t| t == "*" || config.topics.contains(t)),
+                "Route topics must be configured topics or '*'"
+            );
+            route.tags = route
+                .tags
+                .iter()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty() && t != "!")
+                .collect();
+            let mut normalized = Vec::with_capacity(route.sinks.len());
+            for sink in &route.sinks {
+                if sink.trim().is_empty() {
+                    continue;
+                }
+                let canonical = normalize_sink(sink)?.to_string();
+                if !normalized.contains(&canonical) {
+                    normalized.push(canonical);
+                }
+            }
+            route.sinks = normalized;
+        }
+        let routes_use_grok_bot = config
+            .routes
+            .iter()
+            .any(|r| r.sinks.iter().any(|s| s == SINK_GROK_BOT));
+        ensure!(
+            !routes_use_grok_bot || !config.grok_bot_webhook_url.is_empty(),
+            "Routes targeting webhook or grokbot require GrokBotWebhookUrl"
+        );
         if !config.grok_bot_webhook_url.is_empty() {
             validate_url(&config.grok_bot_webhook_url).context("Invalid GrokBotWebhookUrl")?;
             ensure!(
@@ -200,26 +323,172 @@ impl Config {
         }
         Ok(config)
     }
-    /// Whether a topic is routed to Grok Bot only and never to Pushover.
+    /// Effective declarative routes: explicit `Routes` when configured, otherwise default routes
+    /// synthesized from `MinimumPriority` and `GrokBot*` settings for backward compatibility.
+    pub fn effective_routes(&self) -> Vec<Route> {
+        if !self.routes.is_empty() {
+            return self.routes.clone();
+        }
+        let mut routes = Vec::new();
+        let non_exclusive: Vec<String> = self
+            .topics
+            .iter()
+            .filter(|t| !self.grok_bot_exclusive_topics.contains(t))
+            .cloned()
+            .collect();
+        if self.grok_bot_exclusive_topics.is_empty() {
+            routes.push(Route {
+                topics: vec![],
+                minimum_priority: self.minimum_priority,
+                tags: vec![],
+                sinks: vec![SINK_PUSHOVER.into()],
+            });
+        } else if !non_exclusive.is_empty() {
+            routes.push(Route {
+                topics: non_exclusive,
+                minimum_priority: self.minimum_priority,
+                tags: vec![],
+                sinks: vec![SINK_PUSHOVER.into()],
+            });
+        }
+        if !self.grok_bot_webhook_url.is_empty() {
+            let mut grok_topics = Vec::new();
+            if !self.grok_bot_topics.is_empty() {
+                for topic in &self.grok_bot_topics {
+                    if !grok_topics.contains(topic) {
+                        grok_topics.push(topic.clone());
+                    }
+                }
+                for topic in &self.grok_bot_exclusive_topics {
+                    if !grok_topics.contains(topic) {
+                        grok_topics.push(topic.clone());
+                    }
+                }
+            }
+            routes.push(Route {
+                topics: grok_topics,
+                minimum_priority: self.grok_bot_minimum_priority,
+                tags: vec!["!grokbot".into()],
+                sinks: vec![SINK_GROK_BOT.into()],
+            });
+        }
+        routes
+    }
+    /// Evaluate routing for a message and return the matched sinks (`pushover`, `grokbot`).
+    ///
+    /// Precedence when explicit `Routes` are configured:
+    /// - Routes are evaluated in declaration order.
+    /// - A topic-specific route (listing `topic` explicitly) shadows later catch-all (`*` or empty
+    ///   `Topics`) routes for that topic so per-topic overrides can restrict or replace default sinks.
+    /// - Multiple routes at the same specificity (e.g. two rules for `alerts` with different
+    ///   `MinimumPriority` or `Tags` thresholds) combine their sinks when both match.
+    /// - Messages tagged `grokbot` are never routed to `grokbot` (loop prevention), and `grokbot`
+    ///   is only returned when `GrokBotWebhookUrl` is configured.
+    pub fn route_sinks(
+        &self,
+        topic: &str,
+        priority: Option<i32>,
+        tags: &[String],
+    ) -> BTreeSet<&'static str> {
+        let mut sinks = BTreeSet::new();
+        let grok_loop = tags.iter().any(|t| t.eq_ignore_ascii_case("grokbot"));
+        let grok_enabled = !self.grok_bot_webhook_url.is_empty();
+        if self.routes.is_empty() {
+            for route in self.effective_routes() {
+                if route.matches(topic, priority, tags) {
+                    for sink in &route.sinks {
+                        if let Ok(canonical) = normalize_sink(sink)
+                            && (canonical != SINK_GROK_BOT || (grok_enabled && !grok_loop))
+                        {
+                            sinks.insert(canonical);
+                        }
+                    }
+                }
+            }
+            return sinks;
+        }
+        // Precedence across explicit routes:
+        // 1. If any route explicitly names `topic`, only explicit-topic routes for `topic` apply
+        //    (catch-all routes are fallback defaults for topics without explicit rules).
+        // 2. Within the applicable routes, if a route with tag filters matches, only matching
+        //    routes with tag filters or higher/equal specificity apply; an empty `Sinks` list on a
+        //    matching route acts as an explicit drop/override for earlier/fallback sinks.
+        let has_explicit_topic_route = self.routes.iter().any(|r| {
+            !r.topics.is_empty()
+                && !r.topics.iter().any(|t| t == "*")
+                && r.topics.iter().any(|t| t == topic)
+        });
+        for route in &self.routes {
+            let is_catch_all = route.topics.is_empty() || route.topics.iter().any(|t| t == "*");
+            if has_explicit_topic_route && is_catch_all {
+                continue;
+            }
+            if !route.matches(topic, priority, tags) {
+                continue;
+            }
+            if route.sinks.is_empty() {
+                sinks.clear();
+                break;
+            }
+            for sink in &route.sinks {
+                if let Ok(canonical) = normalize_sink(sink)
+                    && (canonical != SINK_GROK_BOT || (grok_enabled && !grok_loop))
+                {
+                    sinks.insert(canonical);
+                }
+            }
+        }
+        sinks
+    }
+    /// Whether a topic is routed to Grok Bot only and never to Pushover at any priority.
     pub fn is_grok_bot_exclusive(&self, topic: &str) -> bool {
-        self.grok_bot_exclusive_topics.iter().any(|t| t == topic)
+        if self.routes.is_empty() {
+            return self.grok_bot_exclusive_topics.iter().any(|t| t == topic);
+        }
+        let has_explicit_topic_route = self.routes.iter().any(|r| {
+            !r.topics.is_empty()
+                && !r.topics.iter().any(|t| t == "*")
+                && r.topics.iter().any(|t| t == topic)
+        });
+        let mut can_pushover = false;
+        for route in &self.routes {
+            let is_catch_all = route.topics.is_empty() || route.topics.iter().any(|t| t == "*");
+            if has_explicit_topic_route && is_catch_all {
+                continue;
+            }
+            if (is_catch_all || route.topics.iter().any(|t| t == topic))
+                && route
+                    .sinks
+                    .iter()
+                    .any(|s| normalize_sink(s).ok() == Some(SINK_PUSHOVER))
+            {
+                can_pushover = true;
+            }
+        }
+        !can_pushover
     }
     /// Whether a message should go to Pushover: never for Grok Bot exclusive topics,
-    /// otherwise when its priority is at least `MinimumPriority`.
+    /// otherwise when a matching route selects Pushover (or `MinimumPriority` in legacy config).
+    #[cfg(test)]
     pub fn routes_to_pushover(&self, topic: &str, priority: Option<i32>) -> bool {
-        !self.is_grok_bot_exclusive(topic) && priority.unwrap_or(3) >= self.minimum_priority
+        self.routes_to_pushover_with_tags(topic, priority, &[])
+    }
+    pub fn routes_to_pushover_with_tags(
+        &self,
+        topic: &str,
+        priority: Option<i32>,
+        tags: &[String],
+    ) -> bool {
+        self.route_sinks(topic, priority, tags)
+            .contains(SINK_PUSHOVER)
     }
     /// Whether a message should go to Grok Bot. `GrokBotMinimumPriority` is applied
     /// independently of `MinimumPriority`. Exclusive topics are always routed (subject to
     /// priority). Messages tagged `grokbot` are never routed back, preventing loops when
     /// Grok Bot itself publishes to ntfy.
     pub fn routes_to_grok_bot(&self, topic: &str, priority: Option<i32>, tags: &[String]) -> bool {
-        !self.grok_bot_webhook_url.is_empty()
-            && (self.grok_bot_topics.is_empty()
-                || self.grok_bot_topics.iter().any(|t| t == topic)
-                || self.is_grok_bot_exclusive(topic))
-            && priority.unwrap_or(3) >= self.grok_bot_minimum_priority
-            && !tags.iter().any(|t| t.eq_ignore_ascii_case("grokbot"))
+        self.route_sinks(topic, priority, tags)
+            .contains(SINK_GROK_BOT)
     }
     pub fn token(&self, topic: &str) -> &str {
         self.topic_tokens
@@ -227,6 +496,63 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.pushover_default_token)
     }
+}
+fn apply_route_env(slot: &mut Value, parts: &[&str], val: String) -> Result<()> {
+    let array = slot.as_array_mut().context("Invalid Routes array")?;
+    let index: usize = parts[0].parse().context("Invalid Routes index")?;
+    ensure!(index < 1024, "Routes index exceeds 1023");
+    while array.len() <= index {
+        array.push(serde_json::json!({}));
+    }
+    if parts.len() == 1 {
+        array[index] = serde_json::from_str(&val).context("Invalid Route JSON")?;
+        return Ok(());
+    }
+    let obj = array[index]
+        .as_object_mut()
+        .context("Invalid Route entry")?;
+    let field = match parts[1].to_ascii_lowercase().as_str() {
+        "topics" | "topic" => "Topics",
+        "minimumpriority" | "minpriority" | "min_priority" | "minimum_priority" => {
+            "MinimumPriority"
+        }
+        "tags" => "Tags",
+        "sinks" | "destinations" => "Sinks",
+        other => bail!("Unknown Route field '{other}'"),
+    };
+    if parts.len() == 2 {
+        if field == "MinimumPriority" {
+            let n: i64 = val.parse().context("Invalid Route MinimumPriority")?;
+            obj.insert(field.into(), Value::Number(n.into()));
+        } else if val.trim_start().starts_with('[') {
+            obj.insert(
+                field.into(),
+                serde_json::from_str(&val).with_context(|| format!("Invalid Route {field}"))?,
+            );
+        } else {
+            let list: Vec<Value> = val
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.into()))
+                .collect();
+            obj.insert(field.into(), Value::Array(list));
+        }
+    } else if parts.len() == 3 && field != "MinimumPriority" {
+        let sub_idx: usize = parts[2]
+            .parse()
+            .with_context(|| format!("Invalid Route {field} index"))?;
+        ensure!(sub_idx < 1024, "Route {field} index exceeds 1023");
+        let entry = obj.entry(field).or_insert_with(|| Value::Array(Vec::new()));
+        let sub = entry
+            .as_array_mut()
+            .with_context(|| format!("Invalid Route {field} array"))?;
+        sub.resize(sub.len().max(sub_idx + 1), Value::String(String::new()));
+        sub[sub_idx] = Value::String(val);
+    } else {
+        bail!("Invalid Route environment override path");
+    }
+    Ok(())
 }
 fn validate_url(s: &str) -> Result<()> {
     let u = reqwest::Url::parse(s)?;
