@@ -12,7 +12,8 @@ jobs:
 
   publish:
     needs: verify
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
+    # Needs Docker/BuildKit; uecb-shared runners have neither.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write

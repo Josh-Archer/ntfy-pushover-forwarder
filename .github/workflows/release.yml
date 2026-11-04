@@ -63,7 +63,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: uecb-shared
+            runner: ubuntu-24.04  # docker build; uecb-shared has no Docker
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -91,7 +91,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: uecb-shared
+            runner: ubuntu-24.04  # docker build; uecb-shared has no Docker
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -142,7 +142,8 @@ jobs:
           retention-days: 1
 
   publish-manifest:
-    runs-on: uecb-shared
+    # Needs Docker/BuildKit; uecb-shared runners have neither.
+    runs-on: ubuntu-latest
     needs: [version, publish-docker]
     if: needs.version.outputs.new_version != ''
     steps:
@@ -176,7 +177,8 @@ jobs:
           docker buildx imagetools inspect "${IMAGE}:${NEW_VERSION}"
 
   publish-helm:
-    runs-on: uecb-shared
+    # Needs Docker/BuildKit; uecb-shared runners have neither.
+    runs-on: ubuntu-latest
     needs: [version, publish-manifest]
     if: needs.version.outputs.new_version != ''
     steps:
