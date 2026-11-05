@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# Literal "ci-" prefix: when called from Release, github.workflow is "Release",
+# so this group never collides with Release's own concurrency group.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-test:
     # Needs Docker/BuildKit; uecb-shared runners have neither.
