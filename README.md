@@ -72,6 +72,63 @@ Keep credentials in environment variables or Kubernetes Secrets. Per-topic token
 | `GrokBotTopics` | Empty routes every topic; otherwise each entry must be a configured topic |
 | `GrokBotMinimumPriority` | `4`; omitted ntfy priorities are treated as `3`. Applied independently of `MinimumPriority` |
 | `GrokBotExclusiveTopics` | Empty. Topics sent to Grok Bot only and never to Pushover at any priority; each must be a configured topic and requires `GrokBotWebhookUrl` (Helm: `grokBot.exclusiveTopics`) |
+| `Routes` | Empty (uses legacy settings as default routes). Declarative list of `{Topics, MinimumPriority, Tags, Sinks}` rules (Helm: `forwarder.routes`) |
+
+### Declarative route configuration (`Routes`)
+
+Instead of configuring destination filters ad hoc, you can declare `Routes` under `Forwarder` (or `forwarder.routes` in Helm). When `Routes` is omitted or empty, existing settings (`MinimumPriority`, `GrokBotWebhookUrl`, `GrokBotTopics`, `GrokBotMinimumPriority`, `GrokBotExclusiveTopics`) automatically map to equivalent default routes so current configurations keep working unchanged.
+
+Each route entry supports:
+
+| Route field | Default / meaning |
+|---|---|
+| `Topics` (alias `Topic`) | Topic name or array of topic names (`["system-alerts"]`), or `[]` / `["*"]` to match every configured topic. Every named topic must be in `Topics` |
+| `MinimumPriority` (alias `MinPriority`) | `1`; ntfy priority threshold `1`–`5` (messages without an ntfy priority default to `3`) |
+| `Tags` | Optional string or array of tag filters (case-insensitive). Positive tags (`"siren"`) must all be present on the message; `!tag` (`"!muted"`, `"!grokbot"`) excludes messages carrying that tag |
+| `Sinks` (alias `Destinations`) | Sink name or array of sinks: `pushover`, `webhook`, or `grokbot` (`webhook` and `grokbot` both use the Grok Bot webhook sink and require `GrokBotWebhookUrl` / `GrokBotWebhookKey`). An empty list (`[]`) drops matching messages |
+
+**Precedence rules:**
+1. Routes are evaluated in declaration order.
+2. **Topic specificity:** if any route explicitly lists a topic, catch-all routes (`Topics: []` or `["*"]`) are skipped for that topic. This lets a per-topic route override a global default (for example, making `cluster-events` webhook-only while `*` goes to `pushover`).
+3. **Combining vs. dropping:** multiple matching routes at the same topic specificity union their `Sinks` (for example, `system-alerts` at priority ≥ 3 to `pushover` and priority ≥ 4 with tag `critical` to `grokbot`). A matching route with `Sinks: []` clears matched sinks and stops evaluation, allowing explicit suppression (such as dropping messages tagged `muted`).
+4. **Loop protection:** messages tagged `grokbot` never route to `webhook` / `grokbot`, even if a route's `Tags` omits `!grokbot`.
+
+Example `appsettings.json` with multi-sink routing and topic/tag overrides:
+
+```json
+{
+  "Forwarder": {
+    "NtfyUrl": "https://ntfy.example.com",
+    "Topics": ["system-alerts", "cluster-events", "media-updates"],
+    "Routes": [
+      {
+        "Topics": ["system-alerts"],
+        "MinimumPriority": 4,
+        "Tags": ["siren", "!muted"],
+        "Sinks": ["pushover", "grokbot"]
+      },
+      {
+        "Topics": ["system-alerts"],
+        "MinimumPriority": 3,
+        "Tags": ["!muted"],
+        "Sinks": ["pushover"]
+      },
+      {
+        "Topics": ["cluster-events"],
+        "MinimumPriority": 2,
+        "Sinks": ["webhook"]
+      },
+      {
+        "Topics": ["*"],
+        "MinimumPriority": 3,
+        "Sinks": ["pushover"]
+      }
+    ]
+  }
+}
+```
+
+Routes can also be supplied or overridden via environment variables using indexed keys such as `Forwarder__Routes__0__Topics__0=system-alerts`, `Forwarder__Routes__0__MinimumPriority=4`, `Forwarder__Routes__0__Tags__0=siren`, and `Forwarder__Routes__0__Sinks__0=pushover` (or comma-separated `Forwarder__Routes__0__Sinks=pushover,grokbot`).
 
 `html` tags preserve markup. `markdown` or `md` tags HTML-escape the body and convert backtick spans to `<code>`. Formatting tags are case insensitive. Action buttons (`actions`) and `click` URLs map to Pushover `url` and `url_title` button fields, preferring the first `view` or `http` action with a URL (non-`view`/`http` actions such as `broadcast` are ignored). URLs are truncated to Pushover's 512-character limit, and button labels (`url_title`) are truncated to 100 characters. Images without an attachment use the first matching `LogoMap` tag, with `mag` as a fallback for topics containing `media`.
 

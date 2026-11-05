@@ -12,7 +12,8 @@ jobs:
 
   publish:
     needs: verify
-    runs-on: home-gh-runner
+    # Needs Docker/BuildKit; uecb-shared runners have neither.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write

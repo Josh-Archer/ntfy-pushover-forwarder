@@ -12,6 +12,7 @@ from pathlib import Path
 import statistics
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -202,8 +203,15 @@ class Process:
         self.log = tempfile.TemporaryFile()
         self.process = subprocess.Popen(command, cwd=self.temp.name, env=env, stdout=self.log, stderr=self.log)
         self.api = api
+        with api.condition:
+            seen = len(api.subscriptions)
+        topics = set(self.config['Topics'])
         try:
             wait_for(lambda: self.health() == 'Healthy')
+            # Health can report ready before the ntfy streams are open. The fake API
+            # (like ntfy without `since`) only streams messages published after the
+            # subscription, so wait for every topic to subscribe before tests publish.
+            wait_for(lambda: topics <= {t for t, _, _ in api.subscriptions[seen:]})
         except Exception:
             self.log.seek(0)
             print(self.log.read().decode())
@@ -230,13 +238,37 @@ class Process:
         cpu = (int(fields[13]) + int(fields[14])) / os.sysconf('SC_CLK_TCK')
         return rss, cpu
 
-    def close(self):
-        self.process.terminate()
+    def signal(self, send):
+        """Send a signal to the worker; False if the sandbox refuses (EPERM/EACCES).
+
+        Some shared CI runners deny signalling even our own child (#57). An
+        already-exited child (ESRCH) counts as success.
+        """
+        if self.process.poll() is not None:
+            return True
         try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
+            send()
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            print(f'warning: cannot signal forwarder pid {self.process.pid}: {error}', file=sys.stderr)
+            return False
+        return True
+
+    def close(self):
+        if self.signal(self.process.terminate):
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if self.signal(self.process.kill):
+                    self.process.wait()
+        else:
+            # Can't stop it; give it a moment in case it is exiting, then abandon
+            # it to the runner's orphan cleanup rather than failing tearDown.
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
         self.log.close()
         self.temp.cleanup()
 
@@ -408,7 +440,8 @@ class Compatibility(unittest.TestCase):
             self.api.send(id='expired', message='durable payload')
             self.posts(1)
             wait_for(lambda: Path(path).exists())
-            self.worker.process.kill()
+            if not self.worker.signal(self.worker.process.kill):
+                self.skipTest('runner sandbox denies signalling the forwarder (#57)')
             self.worker.process.wait()
             self.worker.close()
             self.worker = None
